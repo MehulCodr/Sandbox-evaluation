@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling>=1.26,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "oneoxygen-sandbox"
+version = "0.1.0"
+description = "A hardened local Docker sandbox runner for One Oxygen"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "One Oxygen" }]
+dependencies = [
+  "docker>=7.1,<8",
+  "pydantic>=2.9,<3",
+  "PyYAML>=6.0.2,<7",
+  "typer>=0.15,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<7",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+oneoxygen-sandbox = "oneoxygen_sandbox.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/oneoxygen_sandbox"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+  "integration: tests that require a running Linux Docker engine",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+

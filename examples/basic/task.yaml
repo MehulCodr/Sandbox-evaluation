@@ -1,0 +1,23 @@
+sandbox:
+  image: oneoxygen-sandbox:phase1
+  task_id: basic-persistent-session
+  task_version: "1.0"
+  working_directory: /workspace
+  input_assets:
+    - source: assets/input.txt
+      destination: input/message.txt
+    - source: assets/process.py
+      destination: process.py
+  output_directory: /workspace/output
+  environment_allowlist: []
+  network_policy: disabled
+  cpu_limit: 0.5
+  memory_limit_bytes: 134217728
+  pid_limit: 32
+  command_timeout_seconds: 15
+  overall_timeout_seconds: 60
+  maximum_output_size_bytes: 1048576
+commands:
+  - python process.py prepare
+  - python process.py finish
+
