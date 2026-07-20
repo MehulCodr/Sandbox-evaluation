@@ -53,6 +53,9 @@ class ToolDispatcher:
         raw_arguments = redact_arguments(call.tool_name, call.arguments)
         result: ToolResult
         try:
+            # Every provider-returned call consumes the deterministic budget,
+            # including unknown, disallowed, and invalid calls.
+            self._increment_counters(call.tool_name)
             if self.submission_state.submitted:
                 raise ToolFailure(
                     ToolErrorCode.ALREADY_SUBMITTED.value,
@@ -66,7 +69,6 @@ class ToolDispatcher:
             tool = self.registry.resolve(call.tool_name)
             self._enforce_policy(tool.name)
             arguments = tool.argument_model.model_validate(call.arguments)
-            self._increment_counters(tool.name)
             context = ToolContext(
                 session=self.session,
                 workspace=self._workspace(self.session.workspace_path),
@@ -130,6 +132,35 @@ class ToolDispatcher:
         self._record_event(result, raw_arguments)
         return result
 
+    def reject(self, call: ToolCall, code: ToolErrorCode, message: str) -> ToolResult:
+        """Record a provider-returned call that orchestration can no longer execute."""
+        self._sequence_number += 1
+        self._increment_counters(call.tool_name)
+        start_timestamp = now_utc()
+        start_monotonic = monotonic()
+        raw_arguments = redact_arguments(call.tool_name, call.arguments)
+        result = failed_result(
+            call_id=call.call_id,
+            tool_name=call.tool_name,
+            code=code,
+            message=message,
+            start_timestamp=start_timestamp,
+            start_monotonic=start_monotonic,
+            maximum_result_bytes=self.policy.max_tool_result_size_bytes,
+        )
+        self._record_event(result, raw_arguments)
+        return result
+
+    @property
+    def required_submission_is_reachable(self) -> bool:
+        """Whether at least one further submit_result attempt remains."""
+        if self.submission_state.submitted:
+            return True
+        if self._total_count >= self.policy.max_total_tool_calls:
+            return False
+        submit_limit = self.policy.per_tool_call_limits.get("submit_result")
+        return submit_limit is None or self._tool_counts["submit_result"] < submit_limit
+
     def definitions(self) -> tuple[dict[str, Any], ...]:
         return tuple(definition.to_provider_dict() for definition in self.registry.definitions())
 
@@ -153,13 +184,13 @@ class ToolDispatcher:
                 ToolErrorCode.TOOL_NOT_ALLOWED.value,
                 "Python execution is not allowed",
             )
-        if self._total_count >= self.policy.max_total_tool_calls:
+        if self._total_count > self.policy.max_total_tool_calls:
             raise ToolFailure(
                 ToolErrorCode.CALL_LIMIT_EXCEEDED.value,
                 "maximum total tool calls exceeded",
             )
         per_tool_limit = self.policy.per_tool_call_limits.get(tool_name)
-        if per_tool_limit is not None and self._tool_counts[tool_name] >= per_tool_limit:
+        if per_tool_limit is not None and self._tool_counts[tool_name] > per_tool_limit:
             raise ToolFailure(
                 ToolErrorCode.CALL_LIMIT_EXCEEDED.value,
                 "per-tool call limit exceeded",

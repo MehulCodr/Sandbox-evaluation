@@ -1,7 +1,27 @@
 """Secure local Docker sandbox runner for One Oxygen."""
 
+from oneoxygen_sandbox.agent import AgentRunner
+from oneoxygen_sandbox.model_adapters import (
+    ModelAdapter,
+    ModelAdapterRegistry,
+    ScriptedModelAdapter,
+    default_model_adapter_registry,
+)
 from oneoxygen_sandbox.models import (
+    AgentTaskSpec,
+    AgentTerminationReason,
     ExecResult,
+    ModelCapabilities,
+    ModelErrorCode,
+    ModelEvent,
+    ModelProvider,
+    ModelRunConfig,
+    ModelToolCallTrace,
+    ModelTurnRequest,
+    ModelTurnResponse,
+    ModelUsage,
+    NormalizedFinishReason,
+    RunMetrics,
     RunRecord,
     SandboxSpec,
     SandboxTask,
@@ -14,15 +34,33 @@ from oneoxygen_sandbox.models import (
 from oneoxygen_sandbox.session import SandboxSession
 
 __all__ = [
+    "AgentRunner",
+    "AgentTaskSpec",
+    "AgentTerminationReason",
     "ExecResult",
+    "ModelAdapter",
+    "ModelAdapterRegistry",
+    "ModelCapabilities",
+    "ModelErrorCode",
+    "ModelEvent",
+    "ModelProvider",
+    "ModelRunConfig",
+    "ModelToolCallTrace",
+    "ModelTurnRequest",
+    "ModelTurnResponse",
+    "ModelUsage",
+    "NormalizedFinishReason",
+    "RunMetrics",
     "RunRecord",
     "SandboxSession",
     "SandboxSpec",
     "SandboxTask",
+    "ScriptedModelAdapter",
     "ToolCall",
     "ToolDefinition",
     "ToolError",
     "ToolPolicy",
     "ToolResult",
+    "default_model_adapter_registry",
 ]
 __version__ = "0.1.0"

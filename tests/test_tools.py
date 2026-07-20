@@ -166,6 +166,27 @@ def test_total_and_per_tool_call_limits(tmp_path: Path) -> None:
     assert second.error.code is ToolErrorCode.CALL_LIMIT_EXCEEDED
 
 
+def test_invalid_calls_count_toward_total_call_limit(tmp_path: Path) -> None:
+    policy = ToolPolicy(max_total_tool_calls=1)
+    with make_session(tmp_path, policy=policy) as session:
+        dispatcher = ToolDispatcher(session)
+        invalid = dispatcher.dispatch(
+            ToolCall(
+                call_id="call-invalid",
+                tool_name="read_text_file",
+                arguments={"path": "seed.txt", "start_line": 5, "end_line": 2},
+            )
+        )
+        exhausted = dispatcher.dispatch(
+            ToolCall(call_id="call-after-invalid", tool_name="list_files", arguments={})
+        )
+
+    assert invalid.error is not None
+    assert invalid.error.code is ToolErrorCode.INVALID_ARGUMENTS
+    assert exhausted.error is not None
+    assert exhausted.error.code is ToolErrorCode.CALL_LIMIT_EXCEEDED
+
+
 def test_calls_after_submission_are_rejected(tmp_path: Path) -> None:
     with make_session(tmp_path) as session:
         output = session.workspace_path / "output"

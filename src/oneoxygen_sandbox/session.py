@@ -24,7 +24,11 @@ from oneoxygen_sandbox.errors import (
     SandboxError,
     SandboxTimeoutError,
 )
-from oneoxygen_sandbox.filesystem import collect_output_artifacts, copy_input_assets
+from oneoxygen_sandbox.filesystem import (
+    collect_output_artifacts,
+    collect_submitted_output_artifacts,
+    copy_input_assets,
+)
 from oneoxygen_sandbox.models import (
     ArtifactMetadata,
     ErrorInformation,
@@ -232,6 +236,16 @@ class SandboxSession:
         return result
 
     def collect_artifacts(self) -> list[ArtifactMetadata]:
+        """Collect every approved output artifact for Phase 1/2 compatibility."""
+        return self._collect_artifacts(submitted_only=False)
+
+    def collect_submitted_artifacts(self) -> list[ArtifactMetadata]:
+        """Collect only artifacts named by a successful agent submission."""
+        if self.record.submission is None:
+            raise LifecycleError("cannot collect submitted artifacts without a submission")
+        return self._collect_artifacts(submitted_only=True)
+
+    def _collect_artifacts(self, *, submitted_only: bool) -> list[ArtifactMetadata]:
         if self._state not in {_SessionState.ACTIVE, _SessionState.TERMINATED}:
             raise LifecycleError(f"cannot collect artifacts in state {self._state}")
         if self.container is None or self.workspace_path is None:
@@ -243,11 +257,20 @@ class SandboxSession:
             self.adapter.stop_container(self.container)
             self._container_stopped = True
         output_root = self.workspace_path.joinpath(*self.spec.output_relative_path.parts)
-        artifacts = collect_output_artifacts(
-            output_root,
-            self.run_directory / "artifacts",
-            self.spec.maximum_output_size_bytes,
-        )
+        if submitted_only:
+            assert self.record.submission is not None
+            artifacts = collect_submitted_output_artifacts(
+                output_root,
+                self.run_directory / "artifacts",
+                self.spec.maximum_output_size_bytes,
+                self.record.submission.artifacts,
+            )
+        else:
+            artifacts = collect_output_artifacts(
+                output_root,
+                self.run_directory / "artifacts",
+                self.spec.maximum_output_size_bytes,
+            )
         self.record.artifacts = artifacts
         self._state = _SessionState.COLLECTED
         return artifacts
@@ -315,6 +338,11 @@ class SandboxSession:
         self.record.end_timestamp = datetime.now(UTC)
         if self._overall_timed_out.is_set() and self.record.error is None:
             self._set_error(SandboxTimeoutError("overall sandbox timeout expired"))
+        if (
+            self.record.termination_reason is not None
+            and self.record.final_status is not RunStatus.RUNNING
+        ):
+            return
         if self.record.error is not None:
             self.record.final_status = (
                 RunStatus.TIMED_OUT

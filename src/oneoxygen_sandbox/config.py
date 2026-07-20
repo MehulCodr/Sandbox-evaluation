@@ -37,8 +37,13 @@ def load_task(path: Path) -> SandboxTask:
 
 
 def configuration_hash(task: SandboxTask) -> str:
+    task_data = task.model_dump(mode="json")
+    # Preserve the Phase 2 hash for legacy task files that do not opt into an
+    # agent. Optional Phase 3A data participates only when it is present.
+    if task_data.get("agent") is None:
+        task_data.pop("agent", None)
     canonical = json.dumps(
-        task.model_dump(mode="json"),
+        task_data,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,

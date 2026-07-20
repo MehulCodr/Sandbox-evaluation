@@ -23,6 +23,9 @@ dev = [
   "pytest-cov>=6,<7",
   "ruff>=0.9,<1",
 ]
+openai = [
+  "openai>=2.46,<3",
+]
 
 [project.scripts]
 oneoxygen-sandbox = "oneoxygen_sandbox.cli:app"
@@ -31,11 +34,12 @@ oneoxygen-sandbox = "oneoxygen_sandbox.cli:app"
 packages = ["src/oneoxygen_sandbox"]
 
 [tool.pytest.ini_options]
-addopts = "-ra"
+addopts = "-ra -m 'not live_api'"
 testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
   "integration: tests that require a running Linux Docker engine",
+  "live_api: opt-in tests that make paid external provider requests",
 ]
 
 [tool.ruff]
@@ -48,4 +52,3 @@ select = ["E", "F", "I", "B", "UP", "RUF", "SIM"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]
-

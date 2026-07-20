@@ -1,0 +1,97 @@
+schema_version: 1
+turns:
+  - tool_calls:
+      - call_id: call-list
+        tool_name: list_files
+        arguments:
+          path: "."
+          max_depth: 2
+      - call_id: call-read
+        tool_name: read_text_file
+        arguments:
+          path: company_metrics.csv
+    usage:
+      input_tokens: 420
+      output_tokens: 90
+      reasoning_tokens: 20
+      cached_input_tokens: 0
+      total_tokens: 510
+  - expected_previous_tool_result_call_ids:
+      - call-list
+      - call-read
+    tool_calls:
+      - call_id: call-calculate
+        tool_name: execute_python
+        arguments:
+          source_code: |
+            import csv
+            from pathlib import Path
+
+            rows = list(csv.DictReader(Path("/workspace/company_metrics.csv").open()))
+            first, last = rows[0], rows[-1]
+            revenue_growth = (
+                (float(last["revenue_usd"]) - float(first["revenue_usd"]))
+                / float(first["revenue_usd"])
+                * 100
+            )
+            gross_margin = float(last["gross_profit_usd"]) / float(last["revenue_usd"]) * 100
+            operating_margin = (
+                float(last["operating_income_usd"]) / float(last["revenue_usd"]) * 100
+            )
+            print(f"revenue_growth_percent={revenue_growth:.1f}")
+            print(f"gross_margin_percent={gross_margin:.1f}")
+            print(f"operating_margin_percent={operating_margin:.1f}")
+    usage:
+      input_tokens: 650
+      output_tokens: 170
+      reasoning_tokens: 45
+      cached_input_tokens: 300
+      total_tokens: 820
+  - expected_previous_tool_result_call_ids:
+      - call-calculate
+    tool_calls:
+      - call_id: call-write
+        tool_name: write_text_file
+        arguments:
+          path: output/findings.md
+          overwrite: false
+          create_parents: true
+          content: |
+            # Synthetic Due-Diligence Findings
+
+            - Revenue grew **20.0%** from FY2024 to FY2025.
+            - FY2025 gross margin was **41.0%**.
+            - Simple observation: operating margin improved from 9.0% to 11.0%, so operating income grew faster than revenue in the synthetic period.
+
+            This synthetic review is not an investment recommendation.
+      - call_id: call-verify
+        tool_name: read_text_file
+        arguments:
+          path: output/findings.md
+    usage:
+      input_tokens: 910
+      output_tokens: 210
+      reasoning_tokens: 35
+      cached_input_tokens: 500
+      total_tokens: 1120
+  - expected_previous_tool_result_call_ids:
+      - call-write
+      - call-verify
+    tool_calls:
+      - call_id: call-submit
+        tool_name: submit_result
+        arguments:
+          summary: Synthetic revenue and margin review completed.
+          artifact_paths:
+            - output/findings.md
+          findings:
+            revenue_growth_percent: 20.0
+            gross_margin_percent: 41.0
+            operating_margin_percent: 11.0
+            source: synthetic
+    usage:
+      input_tokens: 1180
+      output_tokens: 85
+      reasoning_tokens: 10
+      cached_input_tokens: 700
+      total_tokens: 1265

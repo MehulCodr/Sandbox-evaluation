@@ -1,5 +1,15 @@
 """Structured exception hierarchy for sandbox operations."""
 
+from __future__ import annotations
+
+from typing import Any
+
+from oneoxygen_sandbox.models import (
+    ModelErrorCode,
+    ModelErrorInformation,
+    sanitize_model_trace_text,
+)
+
 
 class SandboxError(Exception):
     """Base class for expected, user-facing sandbox failures."""
@@ -53,6 +63,53 @@ class RecordPersistenceError(SandboxError):
 
 class CleanupError(SandboxError):
     code = "cleanup_error"
+
+
+def sanitize_model_error_message(value: str) -> str:
+    """Bound and redact a provider error before it reaches logs or run records."""
+    message = sanitize_model_trace_text(value).strip()
+    if not message:
+        message = "model provider request failed"
+    return message[:2_000]
+
+
+class ModelError(SandboxError):
+    """Stable, sanitized model-adapter failure safe for persistence and display."""
+
+    code = "model_error"
+
+    def __init__(
+        self,
+        model_code: ModelErrorCode | str,
+        message: str,
+        *,
+        retryable: bool = False,
+        provider_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        normalized_code = ModelErrorCode(model_code)
+        sanitized = sanitize_model_error_message(message)
+        self.error = ModelErrorInformation(
+            code=normalized_code,
+            message=sanitized,
+            retryable=retryable,
+            provider_metadata=provider_metadata or {},
+        )
+        self.model_code = normalized_code
+        self.error_code = normalized_code
+        self.message = sanitized
+        self.retryable = retryable
+        self.provider_metadata = self.error.provider_metadata
+        self.code = normalized_code.value
+        super().__init__(sanitized)
+
+    @classmethod
+    def from_information(cls, error: ModelErrorInformation) -> ModelError:
+        return cls(
+            error.code,
+            error.message,
+            retryable=error.retryable,
+            provider_metadata=error.provider_metadata,
+        )
 
 
 class ToolFailure(SandboxError):

@@ -141,8 +141,19 @@ def _collect_output_artifacts(
     output_root: Path,
     artifact_directory: Path,
     maximum_size_bytes: int,
+    approved_relative_paths: frozenset[str] | None = None,
 ) -> list[ArtifactMetadata]:
     files = _approved_files(output_root)
+    if approved_relative_paths is not None:
+        available = {relative.as_posix() for _source, relative in files}
+        missing = approved_relative_paths - available
+        if missing:
+            raise PathSafetyError("a submitted output artifact is no longer available")
+        files = [
+            (source, relative)
+            for source, relative in files
+            if relative.as_posix() in approved_relative_paths
+        ]
     total_size = 0
     sized_files: list[tuple[Path, Path, int]] = []
     for source, relative in files:
@@ -183,6 +194,34 @@ def collect_output_artifacts(
         return _collect_output_artifacts(output_root, artifact_directory, maximum_size_bytes)
     except OSError as exc:
         raise PathSafetyError(f"cannot safely collect output artifacts: {exc}") from exc
+
+
+def collect_submitted_output_artifacts(
+    output_root: Path,
+    artifact_directory: Path,
+    maximum_size_bytes: int,
+    submitted_artifacts: tuple[ArtifactMetadata, ...],
+) -> list[ArtifactMetadata]:
+    """Copy exactly the artifacts approved by a successful submission."""
+    approved_paths = frozenset(artifact.relative_path for artifact in submitted_artifacts)
+    if len(approved_paths) != len(submitted_artifacts):
+        raise PathSafetyError("submitted output artifact paths must be unique")
+    try:
+        collected = _collect_output_artifacts(
+            output_root,
+            artifact_directory,
+            maximum_size_bytes,
+            approved_paths,
+        )
+    except OSError as exc:
+        raise PathSafetyError(f"cannot safely collect submitted output artifacts: {exc}") from exc
+
+    expected = {artifact.relative_path: artifact for artifact in submitted_artifacts}
+    for artifact in collected:
+        submitted = expected[artifact.relative_path]
+        if artifact.size_bytes != submitted.size_bytes or artifact.sha256 != submitted.sha256:
+            raise PathSafetyError("a submitted output artifact changed after submission")
+    return collected
 
 
 @dataclass(frozen=True)

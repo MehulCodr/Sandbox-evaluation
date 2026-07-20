@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
 from datetime import UTC, datetime
 from enum import StrEnum
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -37,10 +40,40 @@ MODEL_PROVIDER_MARKERS = (
     "PERPLEXITY",
     "TOGETHER",
 )
+MAXIMUM_MODEL_METADATA_BYTES = 16 * 1024
+MAXIMUM_MODEL_EVENT_TEXT_BYTES = 64 * 1024
 
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class _FrozenJSONDict(dict[str, Any]):
+    """A JSON mapping that retains normal serialization but rejects mutation."""
+
+    @staticmethod
+    def _immutable(*_args: Any, **_kwargs: Any) -> None:
+        raise TypeError("model configuration is immutable")
+
+    __delitem__ = _immutable
+    __ior__ = _immutable
+    __setitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+    def __deepcopy__(self, _memo: dict[int, Any]) -> _FrozenJSONDict:
+        return self
+
+
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return _FrozenJSONDict({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item) for item in value)
+    return value
 
 
 class NetworkPolicy(StrEnum):
@@ -53,6 +86,77 @@ class RunStatus(StrEnum):
     FAILED = "failed"
     TIMED_OUT = "timed_out"
     ERROR = "error"
+    INCOMPLETE = "incomplete"
+    REFUSED = "refused"
+    LIMIT_EXCEEDED = "limit_exceeded"
+    PROVIDER_ERROR = "provider_error"
+    SANDBOX_ERROR = "sandbox_error"
+    CANCELLED = "cancelled"
+    INTERNAL_ERROR = "internal_error"
+
+
+class AgentTerminationReason(StrEnum):
+    SUCCESSFUL_SUBMISSION = "successful_submission"
+    FINAL_TEXT_WITHOUT_SUBMISSION = "final_text_without_submission"
+    MAXIMUM_TURNS_REACHED = "maximum_turns_reached"
+    MAXIMUM_PROVIDER_REQUESTS_REACHED = "maximum_provider_requests_reached"
+    INPUT_TOKEN_LIMIT_REACHED = "input_token_limit_reached"
+    OUTPUT_TOKEN_LIMIT_REACHED = "output_token_limit_reached"
+    TOTAL_TOKEN_LIMIT_REACHED = "total_token_limit_reached"
+    CONTEXT_LIMIT_EXCEEDED = "context_limit_exceeded"
+    OVERALL_WALL_TIME_LIMIT_REACHED = "overall_wall_time_limit_reached"
+    REPEATED_PROVIDER_FAILURE = "repeated_provider_failure"
+    MODEL_REFUSAL = "model_refusal"
+    SANDBOX_FAILURE = "sandbox_failure"
+    TOOL_FAILURE = "tool_failure"
+    USER_INTERRUPTION = "user_interruption"
+    INTERNAL_ORCHESTRATION_ERROR = "internal_orchestration_error"
+
+
+class FinalTextBehavior(StrEnum):
+    INCOMPLETE = "incomplete"
+    SUCCEED = "succeed"
+
+
+class ModelProvider(StrEnum):
+    SCRIPTED = "scripted"
+    OPENAI = "openai"
+
+
+class ToolSchemaMode(StrEnum):
+    PORTABLE = "portable"
+    NATIVE_STRICT = "native_strict"
+
+
+class NormalizedFinishReason(StrEnum):
+    TOOL_CALLS = "tool_calls"
+    COMPLETED = "completed"
+    LENGTH = "length"
+    REFUSED = "refused"
+    CONTENT_FILTER = "content_filter"
+    CANCELLED = "cancelled"
+    PROVIDER_ERROR = "provider_error"
+    UNKNOWN = "unknown"
+
+
+class ModelErrorCode(StrEnum):
+    PROVIDER_NOT_CONFIGURED = "provider_not_configured"
+    MISSING_DEPENDENCY = "missing_dependency"
+    MISSING_API_KEY = "missing_api_key"
+    AUTHENTICATION_FAILED = "authentication_failed"
+    PERMISSION_DENIED = "permission_denied"
+    RATE_LIMITED = "rate_limited"
+    REQUEST_TIMEOUT = "request_timeout"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    INVALID_REQUEST = "invalid_request"
+    UNSUPPORTED_PARAMETER = "unsupported_parameter"
+    INVALID_PROVIDER_RESPONSE = "invalid_provider_response"
+    DUPLICATE_TOOL_CALL_ID = "duplicate_tool_call_id"
+    MALFORMED_TOOL_ARGUMENTS = "malformed_tool_arguments"
+    CONTEXT_LIMIT_EXCEEDED = "context_limit_exceeded"
+    MODEL_REFUSAL = "model_refusal"
+    INTERNAL_ADAPTER_ERROR = "internal_adapter_error"
+    CANCELLED = "cancelled"
 
 
 class ToolErrorCode(StrEnum):
@@ -93,6 +197,193 @@ def is_forbidden_environment_name(value: str) -> bool:
     )
 
 
+def sanitize_model_trace_text(value: str) -> str:
+    """Redact credentials and local paths before model data is persisted."""
+    sanitized = str(value).replace("\x00", "")
+    for name, secret in os.environ.items():
+        if secret and len(secret) >= 8 and is_forbidden_environment_name(name):
+            sanitized = sanitized.replace(secret, "[REDACTED]")
+    sanitized = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", sanitized)
+    sanitized = re.sub(
+        r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+",
+        r"\1[REDACTED]",
+        sanitized,
+    )
+    for path in (Path.cwd(), Path.home()):
+        path_text = str(path)
+        if path_text:
+            sanitized = sanitized.replace(path_text, "[HOST_PATH]")
+            sanitized = sanitized.replace(path_text.replace("\\", "/"), "[HOST_PATH]")
+    return re.sub(r"(?<![A-Za-z0-9])[A-Za-z]:\\[^\r\n\t\"']+", "[HOST_PATH]", sanitized)
+
+
+def _sanitize_model_metadata(value: Any) -> Any:
+    if isinstance(value, str):
+        return sanitize_model_trace_text(value)
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized = str(key).upper()
+            if is_forbidden_environment_name(normalized) or any(
+                marker in normalized
+                for marker in ("AUTHORIZATION", "API_KEY", "CREDENTIAL", "PASSWORD", "SECRET")
+            ):
+                sanitized[str(key)] = "[REDACTED]"
+            else:
+                sanitized[str(key)] = _sanitize_model_metadata(item)
+        return sanitized
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_model_metadata(item) for item in value]
+    return value
+
+
+def normalize_finish_reason(value: str | None) -> NormalizedFinishReason:
+    """Map common provider finish labels without inventing provider-specific detail."""
+    if value is None:
+        return NormalizedFinishReason.UNKNOWN
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "tool_call": NormalizedFinishReason.TOOL_CALLS,
+        "function_call": NormalizedFinishReason.TOOL_CALLS,
+        "function_calls": NormalizedFinishReason.TOOL_CALLS,
+        "stop": NormalizedFinishReason.COMPLETED,
+        "complete": NormalizedFinishReason.COMPLETED,
+        "end_turn": NormalizedFinishReason.COMPLETED,
+        "max_tokens": NormalizedFinishReason.LENGTH,
+        "max_output_tokens": NormalizedFinishReason.LENGTH,
+        "refusal": NormalizedFinishReason.REFUSED,
+        "blocked": NormalizedFinishReason.CONTENT_FILTER,
+        "canceled": NormalizedFinishReason.CANCELLED,
+        "error": NormalizedFinishReason.PROVIDER_ERROR,
+    }
+    try:
+        return NormalizedFinishReason(normalized)
+    except ValueError:
+        return aliases.get(normalized, NormalizedFinishReason.UNKNOWN)
+
+
+def _bounded_json_mapping(value: dict[str, Any], label: str) -> dict[str, Any]:
+    value = _sanitize_model_metadata(value)
+    try:
+        serialized = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must contain only finite JSON values") from exc
+    if len(serialized) > MAXIMUM_MODEL_METADATA_BYTES:
+        raise ValueError(f"{label} exceeds {MAXIMUM_MODEL_METADATA_BYTES} bytes")
+    return value
+
+
+def _validate_provider_settings(value: dict[str, Any]) -> dict[str, Any]:
+    def inspect(item: Any) -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                normalized = str(key).upper()
+                if is_forbidden_environment_name(normalized) or any(
+                    marker in normalized
+                    for marker in (
+                        "AUTHORIZATION",
+                        "API_KEY",
+                        "CREDENTIAL",
+                        "PASSWORD",
+                        "SECRET",
+                    )
+                ):
+                    raise ValueError("provider settings may not contain credentials or secrets")
+                inspect(child)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                inspect(child)
+        elif isinstance(item, str):
+            sanitized = sanitize_model_trace_text(item)
+            if "[REDACTED]" in sanitized or "[HOST_PATH]" in sanitized:
+                raise ValueError("provider settings may not contain credentials or host paths")
+
+    inspect(value)
+    return _bounded_json_mapping(value, "provider_settings")
+
+
+class ModelRunConfig(StrictModel):
+    provider: ModelProvider
+    model: str = Field(min_length=1, max_length=256)
+    maximum_output_tokens: int = Field(default=4_096, ge=1, le=1_000_000)
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    model_call_timeout_seconds: float = Field(default=60.0, gt=0, le=3_600)
+    maximum_retry_attempts: int = Field(default=2, ge=0, le=20)
+    initial_retry_delay_seconds: float = Field(default=1.0, ge=0, le=300)
+    provider_settings: dict[str, Any] = Field(default_factory=dict)
+    tool_schema_mode: ToolSchemaMode = ToolSchemaMode.PORTABLE
+    store_provider_response: bool = False
+
+    @field_validator("model")
+    @classmethod
+    def validate_model(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized or "\x00" in normalized or any(char in normalized for char in "\r\n"):
+            raise ValueError("model must be a non-empty single-line identifier")
+        sanitized = sanitize_model_trace_text(normalized)
+        if "[REDACTED]" in sanitized or "[HOST_PATH]" in sanitized:
+            raise ValueError("model identifier may not contain credentials or host paths")
+        return normalized
+
+    @field_validator("provider_settings")
+    @classmethod
+    def validate_provider_settings(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _freeze_json(_validate_provider_settings(value))
+
+    def requested_settings(self) -> dict[str, Any]:
+        """Return the sanitized, canonical settings requested for this run."""
+        return self.model_dump(mode="json")
+
+
+class ModelCapabilities(StrictModel):
+    tool_calling: bool = False
+    multiple_tool_calls_per_turn: bool = False
+    reasoning_token_reporting: bool = False
+    cached_token_reporting: bool = False
+    temperature_support: bool = False
+    seed_support: bool = False
+    strict_tool_schemas: bool = False
+    response_storage_control: bool = False
+
+
+class ModelUsage(StrictModel):
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    reasoning_tokens: int | None = Field(default=None, ge=0)
+    cached_input_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    provider_metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("provider_metadata")
+    @classmethod
+    def validate_provider_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _bounded_json_mapping(value, "usage provider metadata")
+
+    @classmethod
+    def aggregate(cls, values: tuple[ModelUsage, ...] | list[ModelUsage]) -> ModelUsage:
+        items = tuple(values)
+
+        def exact_sum(field_name: str) -> int | None:
+            if not items:
+                return None
+            components = [getattr(item, field_name) for item in items]
+            return None if any(component is None for component in components) else sum(components)
+
+        return cls(
+            input_tokens=exact_sum("input_tokens"),
+            output_tokens=exact_sum("output_tokens"),
+            reasoning_tokens=exact_sum("reasoning_tokens"),
+            cached_input_tokens=exact_sum("cached_input_tokens"),
+            total_tokens=exact_sum("total_tokens"),
+        )
+
+
 def _workspace_relative(value: str, label: str, *, allow_root: bool) -> PurePosixPath:
     if "\\" in value or "\x00" in value:
         raise ValueError(f"{label} must use a safe POSIX container path")
@@ -107,6 +398,17 @@ def _workspace_relative(value: str, label: str, *, allow_root: bool) -> PurePosi
     if not allow_root and not path.parts:
         raise ValueError(f"{label} may not refer to the complete workspace")
     return path
+
+
+def _task_relative_file(value: str, label: str) -> str:
+    if "\x00" in value or "\\" in value:
+        raise ValueError(f"{label} must use a safe relative POSIX path")
+    path = PurePosixPath(value)
+    if path.is_absolute() or re.match(r"^[A-Za-z]:", value):
+        raise ValueError(f"{label} must be relative to the task directory")
+    if any(part in {"", ".", ".."} for part in path.parts) or not path.parts:
+        raise ValueError(f"{label} contains an unsafe path component")
+    return path.as_posix()
 
 
 class InputAsset(StrictModel):
@@ -255,10 +557,51 @@ class ToolPolicy(StrictModel):
         return tuple(deduplicated)
 
 
+class AgentTaskSpec(StrictModel):
+    instruction_file: str = Field(min_length=1, max_length=512)
+    system_prompt_file: str | None = Field(default=None, min_length=1, max_length=512)
+    system_prompt_version: str = "standard_agent_v1"
+    maximum_model_turns: int = Field(default=20, ge=1, le=10_000)
+    maximum_provider_requests: int = Field(default=60, ge=1, le=100_000)
+    maximum_total_input_tokens: int | None = Field(default=None, ge=1)
+    maximum_total_output_tokens: int | None = Field(default=None, ge=1)
+    maximum_total_tokens: int | None = Field(default=None, ge=1)
+    overall_wall_time_seconds: float = Field(default=600.0, gt=0, le=86_400)
+    required_submission: bool = True
+    final_text_without_submission: FinalTextBehavior = FinalTextBehavior.INCOMPLETE
+
+    @field_validator("instruction_file")
+    @classmethod
+    def validate_instruction_file(cls, value: str) -> str:
+        return _task_relative_file(value, "instruction_file")
+
+    @field_validator("system_prompt_file")
+    @classmethod
+    def validate_system_prompt_file(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _task_relative_file(value, "system_prompt_file")
+
+    @field_validator("system_prompt_version")
+    @classmethod
+    def validate_system_prompt_version(cls, value: str) -> str:
+        return _validate_identifier(value, "system_prompt_version")
+
+    @model_validator(mode="after")
+    def validate_submission_behavior(self) -> AgentTaskSpec:
+        if (
+            self.required_submission
+            and self.final_text_without_submission is FinalTextBehavior.SUCCEED
+        ):
+            raise ValueError("final text cannot succeed when a submit_result call is required")
+        return self
+
+
 class SandboxTask(StrictModel):
     sandbox: SandboxSpec
     commands: tuple[str, ...] = Field(default=(), max_length=100)
     tool_policy: ToolPolicy = Field(default_factory=ToolPolicy)
+    agent: AgentTaskSpec | None = None
 
     @field_validator("commands")
     @classmethod
@@ -350,6 +693,7 @@ class ToolCall(StrictModel):
     tool_name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    original_index: int | None = Field(default=None, ge=0)
 
     @field_validator("call_id")
     @classmethod
@@ -360,6 +704,39 @@ class ToolCall(StrictModel):
     @classmethod
     def validate_tool_name(cls, value: str) -> str:
         return _validate_tool_name(value)
+
+
+class ModelToolCallTrace(StrictModel):
+    """Bounded, content-redacted representation of a normalized model tool call."""
+
+    call_id: str = Field(min_length=1, max_length=128)
+    tool_name: str
+    original_index: int = Field(ge=0)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    arguments_sha256: str
+    arguments_truncated: bool = False
+
+    @field_validator("call_id")
+    @classmethod
+    def validate_call_id(cls, value: str) -> str:
+        return _validate_identifier(value, "call_id")
+
+    @field_validator("tool_name")
+    @classmethod
+    def validate_tool_name(cls, value: str) -> str:
+        return _validate_tool_name(value)
+
+    @field_validator("arguments")
+    @classmethod
+    def validate_arguments(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _bounded_json_mapping(value, "model tool-call trace arguments")
+
+    @field_validator("arguments_sha256")
+    @classmethod
+    def validate_hash(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError("arguments_sha256 must be a lowercase SHA-256 digest")
+        return value
 
 
 class ToolError(StrictModel):
@@ -378,6 +755,176 @@ class ToolResult(StrictModel):
     duration_seconds: float = Field(ge=0)
     truncated: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ModelErrorInformation(StrictModel):
+    code: ModelErrorCode
+    message: str = Field(min_length=1, max_length=2_000)
+    retryable: bool = False
+    provider_metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("message")
+    @classmethod
+    def validate_message(cls, value: str) -> str:
+        sanitized = sanitize_model_trace_text(value).strip()[:2_000]
+        return sanitized or "model provider request failed"
+
+    @field_validator("provider_metadata")
+    @classmethod
+    def validate_provider_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _bounded_json_mapping(value, "model error provider metadata")
+
+
+class ModelAttempt(StrictModel):
+    attempt_number: int = Field(ge=1)
+    start_timestamp: datetime
+    end_timestamp: datetime
+    latency_seconds: float = Field(ge=0)
+    succeeded: bool
+    error_code: ModelErrorCode | None = None
+    retryable: bool = False
+    retry_delay_seconds: float | None = Field(default=None, ge=0)
+    request_timeout_seconds: float | None = Field(default=None, gt=0, le=3_600)
+    provider_metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("provider_metadata")
+    @classmethod
+    def validate_provider_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _bounded_json_mapping(value, "model attempt provider metadata")
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> ModelAttempt:
+        if self.end_timestamp < self.start_timestamp:
+            raise ValueError("model attempt end timestamp precedes its start timestamp")
+        if self.succeeded and self.error_code is not None:
+            raise ValueError("a successful model attempt cannot have an error code")
+        if not self.succeeded and self.error_code is None:
+            raise ValueError("a failed model attempt must have an error code")
+        return self
+
+
+class ModelTurnRequest(StrictModel):
+    turn_number: int = Field(ge=1)
+    system_prompt: str = Field(min_length=1, max_length=256_000)
+    initial_task_instruction: str = Field(min_length=1, max_length=1_000_000)
+    tool_definitions: tuple[ToolDefinition, ...]
+    tool_results: tuple[ToolResult, ...] = ()
+    run_config: ModelRunConfig
+    request_timeout_seconds: float | None = Field(default=None, gt=0, le=3_600)
+
+
+class ModelTurnResponse(StrictModel):
+    response_id: str | None = Field(default=None, min_length=1, max_length=512)
+    provider: ModelProvider
+    requested_model: str = Field(min_length=1, max_length=256)
+    returned_model: str | None = Field(default=None, min_length=1, max_length=256)
+    text: str = ""
+    tool_calls: tuple[ToolCall, ...] = ()
+    finish_reason: NormalizedFinishReason = NormalizedFinishReason.UNKNOWN
+    usage: ModelUsage = Field(default_factory=ModelUsage)
+    latency_seconds: float = Field(default=0, ge=0)
+    attempts: tuple[ModelAttempt, ...] = ()
+    attempt_count: int = Field(default=1, ge=1)
+    warnings: tuple[str, ...] = Field(default=(), max_length=100)
+    provider_metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("warnings")
+    @classmethod
+    def validate_warnings(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        sanitized = tuple(sanitize_model_trace_text(value).strip()[:1_000] for value in values)
+        if any(not value for value in sanitized):
+            raise ValueError("warnings must be non-empty and at most 1000 characters")
+        return sanitized
+
+    @field_validator("provider_metadata")
+    @classmethod
+    def validate_provider_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _bounded_json_mapping(value, "model response provider metadata")
+
+    @model_validator(mode="after")
+    def validate_attempt_count(self) -> ModelTurnResponse:
+        if self.attempts and self.attempt_count != len(self.attempts):
+            raise ValueError("attempt_count must match the number of attempt records")
+        return self
+
+
+class ModelEvent(StrictModel):
+    schema_version: int = 1
+    sequence_number: int = Field(ge=1)
+    turn_number: int = Field(ge=1)
+    provider: ModelProvider
+    requested_model: str = Field(min_length=1, max_length=256)
+    returned_model: str | None = Field(default=None, min_length=1, max_length=256)
+    request_start_timestamp: datetime
+    request_end_timestamp: datetime
+    latency_seconds: float = Field(ge=0)
+    attempt_count: int = Field(ge=1)
+    attempts: tuple[ModelAttempt, ...] = ()
+    finish_reason: NormalizedFinishReason
+    text: str = ""
+    text_sha256: str = ""
+    text_truncated: bool = False
+    tool_calls: tuple[ModelToolCallTrace, ...] = ()
+    usage: ModelUsage = Field(default_factory=ModelUsage)
+    requested_settings: dict[str, Any]
+    effective_settings: dict[str, Any]
+    tool_definitions_sha256: str
+    prompt_sha256: str
+    response_id: str | None = Field(default=None, min_length=1, max_length=512)
+    warnings: tuple[str, ...] = Field(default=(), max_length=100)
+    error: ModelErrorInformation | None = None
+    provider_metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def bound_and_hash_text(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        updated = dict(value)
+        text = updated.get("text", "")
+        if not isinstance(text, str):
+            return updated
+        raw = text.encode("utf-8")
+        updated["text_sha256"] = hashlib.sha256(raw).hexdigest()
+        sanitized = sanitize_model_trace_text(text).encode("utf-8")
+        updated["text"] = sanitized.decode("utf-8")
+        if (
+            len(raw) > MAXIMUM_MODEL_EVENT_TEXT_BYTES
+            or len(sanitized) > MAXIMUM_MODEL_EVENT_TEXT_BYTES
+        ):
+            updated["text"] = sanitized[:MAXIMUM_MODEL_EVENT_TEXT_BYTES].decode(
+                "utf-8", errors="ignore"
+            )
+            updated["text_truncated"] = True
+        return updated
+
+    @field_validator("requested_settings", "effective_settings", "provider_metadata")
+    @classmethod
+    def validate_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _bounded_json_mapping(value, "model event metadata")
+
+    @field_validator("tool_definitions_sha256", "prompt_sha256", "text_sha256")
+    @classmethod
+    def validate_hash(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError("hash values must be lowercase SHA-256 digests")
+        return value
+
+    @field_validator("warnings")
+    @classmethod
+    def validate_warnings(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        sanitized = tuple(sanitize_model_trace_text(value).strip()[:1_000] for value in values)
+        if any(not value for value in sanitized):
+            raise ValueError("warnings must be non-empty and at most 1000 characters")
+        return sanitized
+
+    @model_validator(mode="after")
+    def validate_event(self) -> ModelEvent:
+        if self.request_end_timestamp < self.request_start_timestamp:
+            raise ValueError("model event end timestamp precedes its start timestamp")
+        if self.attempts and self.attempt_count != len(self.attempts):
+            raise ValueError("attempt_count must match the number of attempt records")
+        return self
 
 
 class SubmittedResult(StrictModel):
@@ -405,10 +952,61 @@ class ToolEvent(StrictModel):
     error_code: ToolErrorCode | None = None
 
 
+class RunMetrics(StrictModel):
+    model_turns: int = Field(default=0, ge=0)
+    provider_attempts: int = Field(default=0, ge=0)
+    successful_tool_calls: int = Field(default=0, ge=0)
+    failed_tool_calls: int = Field(default=0, ge=0)
+    total_input_tokens: int | None = Field(default=None, ge=0)
+    total_output_tokens: int | None = Field(default=None, ge=0)
+    total_reasoning_tokens: int | None = Field(default=None, ge=0)
+    total_cached_input_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    total_model_latency_seconds: float = Field(default=0, ge=0)
+    total_tool_latency_seconds: float = Field(default=0, ge=0)
+    total_wall_time_seconds: float = Field(default=0, ge=0)
+    token_usage_incomplete: bool = False
+
+    @classmethod
+    def aggregate(
+        cls,
+        model_events: tuple[ModelEvent, ...] | list[ModelEvent],
+        tool_events: tuple[ToolEvent, ...] | list[ToolEvent],
+        *,
+        total_wall_time_seconds: float = 0,
+    ) -> RunMetrics:
+        model_items = tuple(model_events)
+        tool_items = tuple(tool_events)
+        usage = ModelUsage.aggregate([event.usage for event in model_items])
+        return cls(
+            model_turns=len(model_items),
+            provider_attempts=sum(event.attempt_count for event in model_items),
+            successful_tool_calls=sum(
+                event.status is ToolEventStatus.SUCCEEDED for event in tool_items
+            ),
+            failed_tool_calls=sum(event.status is ToolEventStatus.FAILED for event in tool_items),
+            total_input_tokens=usage.input_tokens,
+            total_output_tokens=usage.output_tokens,
+            total_reasoning_tokens=usage.reasoning_tokens,
+            total_cached_input_tokens=usage.cached_input_tokens,
+            total_tokens=usage.total_tokens,
+            total_model_latency_seconds=sum(event.latency_seconds for event in model_items),
+            total_tool_latency_seconds=sum(event.duration_seconds for event in tool_items),
+            total_wall_time_seconds=total_wall_time_seconds,
+            token_usage_incomplete=bool(model_items)
+            and any(
+                event.usage.input_tokens is None
+                or event.usage.output_tokens is None
+                or event.usage.total_tokens is None
+                for event in model_items
+            ),
+        )
+
+
 class RunRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    record_schema_version: int = 2
+    record_schema_version: int = 3
     run_id: str
     task_id: str
     task_version: str
@@ -422,6 +1020,15 @@ class RunRecord(BaseModel):
     tool_policy: ToolPolicy | None = None
     tool_events: list[ToolEvent] = Field(default_factory=list)
     submission: SubmittedResult | None = None
+    model_configuration: ModelRunConfig | None = None
+    effective_model_settings: dict[str, Any] = Field(default_factory=dict)
+    model_events: list[ModelEvent] = Field(default_factory=list)
+    metrics: RunMetrics = Field(default_factory=RunMetrics)
+    termination_reason: AgentTerminationReason | None = None
+    system_prompt_version: str | None = None
+    system_prompt_sha256: str | None = None
+    system_prompt_content: str | None = Field(default=None, max_length=64_000)
+    task_instruction_sha256: str | None = None
     final_status: RunStatus = RunStatus.RUNNING
     error: ErrorInformation | None = None
     artifacts: list[ArtifactMetadata] = Field(default_factory=list)
