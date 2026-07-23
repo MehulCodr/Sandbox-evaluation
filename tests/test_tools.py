@@ -11,6 +11,8 @@ from pydantic import BaseModel, ConfigDict
 
 from oneoxygen_sandbox.errors import ToolFailure
 from oneoxygen_sandbox.models import (
+    BrowserConfig,
+    BrowserSourceProfile,
     ExecResult,
     InputAsset,
     RunRecord,
@@ -78,7 +80,12 @@ class FakeDockerAdapter:
         return None
 
 
-def make_session(tmp_path: Path, *, policy: ToolPolicy | None = None) -> SandboxSession:
+def make_session(
+    tmp_path: Path,
+    *,
+    policy: ToolPolicy | None = None,
+    browser: BrowserConfig | None = None,
+) -> SandboxSession:
     task_directory = tmp_path / "task"
     task_directory.mkdir()
     spec = SandboxSpec(
@@ -88,7 +95,11 @@ def make_session(tmp_path: Path, *, policy: ToolPolicy | None = None) -> Sandbox
         input_assets=(InputAsset(source="seed.txt", destination="seed.txt"),),
     )
     (task_directory / "seed.txt").write_text("seed\n", encoding="utf-8")
-    task = SandboxTask(sandbox=spec, tool_policy=policy or ToolPolicy())
+    task = SandboxTask(
+        sandbox=spec,
+        tool_policy=policy or ToolPolicy(),
+        browser=browser,
+    )
     return SandboxSession(task, task_directory, tmp_path / "runs", FakeDockerAdapter())
 
 
@@ -112,6 +123,8 @@ def test_tool_schema_generation_is_deterministic() -> None:
     assert registry.names() == tuple(sorted(registry.names()))
     assert "execute_python" in first
     assert "source_code" in first
+    assert "browser_open" in first
+    assert "browser_sources" in first
 
 
 def test_duplicate_tool_registration_is_rejected() -> None:
@@ -148,6 +161,119 @@ def test_dangerous_tools_are_not_allowed_by_default(tmp_path: Path) -> None:
 
     assert result.error is not None
     assert result.error.code is ToolErrorCode.TOOL_NOT_ALLOWED
+
+
+class FakeBrowserClient:
+    def __init__(self, text: str = "Public filing evidence") -> None:
+        self.calls: list[tuple[str, BrowserConfig, frozenset[str]]] = []
+        self.text = text
+
+    def open(
+        self,
+        url: str,
+        *,
+        config: BrowserConfig,
+        allowed_hosts: frozenset[str],
+    ) -> dict[str, Any]:
+        self.calls.append((url, config, allowed_hosts))
+        return {
+            "requested_url": url,
+            "final_url": url,
+            "status": 200,
+            "content_type": "text/html",
+            "title": "SEC filing",
+            "text": self.text,
+            "links": [],
+            "truncated": False,
+            "untrusted_content": True,
+        }
+
+
+def test_browser_tools_use_task_profiles_and_redact_query_trace(tmp_path: Path) -> None:
+    browser = BrowserConfig(
+        source_profiles=(BrowserSourceProfile.SEC_EDGAR,),
+        user_agent="OneOxygen-Test/1.0 test@example.com",
+    )
+    policy = ToolPolicy(
+        allowed_tool_names=("browser_sources", "browser_open"),
+        max_total_tool_calls=2,
+    )
+    client = FakeBrowserClient()
+    registry = default_tool_registry(client)
+    with make_session(tmp_path, policy=policy, browser=browser) as session:
+        dispatcher = ToolDispatcher(session, registry=registry)
+        sources = dispatcher.dispatch(
+            ToolCall(call_id="call-sources", tool_name="browser_sources", arguments={})
+        )
+        opened = dispatcher.dispatch(
+            ToolCall(
+                call_id="call-open",
+                tool_name="browser_open",
+                arguments={"url": "https://www.sec.gov/Archives/test?company=public#fragment"},
+            )
+        )
+        trace_arguments = session.record.tool_events[-1].arguments
+        recorded_hosts = session.record.browser_allowed_hosts
+        policy_digest = session.record.browser_policy_sha256
+
+    assert sources.success is True
+    assert sources.content["profiles"][0]["id"] == "sec_edgar"
+    assert opened.success is True
+    assert client.calls[0][0] == "https://www.sec.gov/Archives/test?company=public"
+    assert trace_arguments["url"] == "https://www.sec.gov/Archives/test"
+    assert trace_arguments["query"]["size_bytes"] == len("company=public")
+    assert "www.sec.gov" in recorded_hosts
+    assert policy_digest is not None and len(policy_digest) == 64
+
+
+def test_browser_open_rejects_an_off_list_host_before_client_access(tmp_path: Path) -> None:
+    browser = BrowserConfig(
+        source_profiles=(BrowserSourceProfile.SEC_EDGAR,),
+        user_agent="OneOxygen-Test/1.0 test@example.com",
+    )
+    policy = ToolPolicy(allowed_tool_names=("browser_open",))
+    client = FakeBrowserClient()
+    registry = default_tool_registry(client)
+    with make_session(tmp_path, policy=policy, browser=browser) as session:
+        result = ToolDispatcher(session, registry=registry).dispatch(
+            ToolCall(
+                call_id="call-open",
+                tool_name="browser_open",
+                arguments={"url": "https://example.com/"},
+            )
+        )
+
+    assert result.error is not None
+    assert result.error.code is ToolErrorCode.URL_NOT_ALLOWED
+    assert client.calls == []
+
+
+def test_browser_open_preserves_structure_when_text_exceeds_tool_result_limit(
+    tmp_path: Path,
+) -> None:
+    browser = BrowserConfig(
+        source_profiles=(BrowserSourceProfile.SEC_EDGAR,),
+        user_agent="OneOxygen-Test/1.0 test@example.com",
+    )
+    policy = ToolPolicy(
+        allowed_tool_names=("browser_open",),
+        max_tool_result_size_bytes=1_024,
+    )
+    registry = default_tool_registry(FakeBrowserClient("evidence " * 2_000))
+    with make_session(tmp_path, policy=policy, browser=browser) as session:
+        result = ToolDispatcher(session, registry=registry).dispatch(
+            ToolCall(
+                call_id="call-open",
+                tool_name="browser_open",
+                arguments={"url": "https://www.sec.gov/Archives/test"},
+            )
+        )
+
+    assert result.success is True
+    assert result.content["tool_result_truncated"] is True
+    assert result.content["text_truncated"] is True
+    assert result.content["final_url"] == "https://www.sec.gov/Archives/test"
+    assert result.truncated is True
 
 
 def test_total_and_per_tool_call_limits(tmp_path: Path) -> None:

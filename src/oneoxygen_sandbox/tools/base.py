@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel
 
@@ -105,6 +106,26 @@ def redact_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any
             }
     if tool_name == "submit_result" and isinstance(redacted.get("findings"), dict):
         redacted["findings"] = {"keys": sorted(str(key) for key in redacted["findings"])}
+    if tool_name == "browser_open" and isinstance(redacted.get("url"), str):
+        raw_url = redacted["url"]
+        try:
+            parsed = urlsplit(raw_url)
+            hostname = parsed.hostname or ""
+            netloc = hostname
+            if parsed.port is not None:
+                netloc = f"{hostname}:{parsed.port}"
+            redacted["url"] = urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+            if parsed.query:
+                query_bytes = parsed.query.encode("utf-8")
+                redacted["query"] = {
+                    "sha256": hashlib.sha256(query_bytes).hexdigest(),
+                    "size_bytes": len(query_bytes),
+                }
+        except ValueError:
+            redacted["url"] = {
+                "sha256": hashlib.sha256(raw_url.encode("utf-8")).hexdigest(),
+                "size_bytes": len(raw_url.encode("utf-8")),
+            }
     return redacted
 
 

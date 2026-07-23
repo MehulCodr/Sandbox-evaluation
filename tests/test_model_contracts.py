@@ -101,13 +101,14 @@ def test_agent_task_is_optional_and_paths_are_safe() -> None:
         AgentTaskSpec(instruction_file="..\\secret.txt")
 
 
-def test_legacy_configuration_hash_excludes_default_agent_field() -> None:
+def test_legacy_configuration_hash_excludes_optional_agent_and_browser_fields() -> None:
     task = SandboxTask(
         sandbox=SandboxSpec(image="image:tag", task_id="legacy-task", task_version="1"),
         commands=("printf ok",),
     )
     phase_two_shape = task.model_dump(mode="json")
     assert phase_two_shape.pop("agent") is None
+    assert phase_two_shape.pop("browser") is None
     canonical = json.dumps(
         phase_two_shape,
         sort_keys=True,

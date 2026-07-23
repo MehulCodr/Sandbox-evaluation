@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from oneoxygen_sandbox.browser import BrowserClient
 from oneoxygen_sandbox.errors import ToolFailure
 from oneoxygen_sandbox.models import ToolDefinition, ToolErrorCode
 from oneoxygen_sandbox.tools.base import Tool
@@ -38,7 +39,8 @@ class ToolRegistry:
         return tuple(sorted(self._tools))
 
 
-def default_tool_registry() -> ToolRegistry:
+def default_tool_registry(browser_client: BrowserClient | None = None) -> ToolRegistry:
+    from oneoxygen_sandbox.tools.browser import BrowserOpenTool, BrowserSourcesTool
     from oneoxygen_sandbox.tools.standard import (
         ExecutePythonTool,
         ExecuteShellTool,
@@ -57,6 +59,8 @@ def default_tool_registry() -> ToolRegistry:
         ReplaceTextTool(),
         ExecuteShellTool(),
         ExecutePythonTool(),
+        BrowserSourcesTool(),
+        BrowserOpenTool(browser_client),
         SubmitResultTool(),
     ):
         registry.register(tool)

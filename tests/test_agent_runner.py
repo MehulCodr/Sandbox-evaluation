@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +16,8 @@ from oneoxygen_sandbox.model_adapters.scripted import ScriptedModelAdapter
 from oneoxygen_sandbox.models import (
     AgentTaskSpec,
     AgentTerminationReason,
+    BrowserConfig,
+    BrowserSourceProfile,
     ExecResult,
     InputAsset,
     ModelCapabilities,
@@ -183,6 +186,7 @@ def make_task(
     *,
     agent_updates: dict[str, object] | None = None,
     policy: ToolPolicy | None = None,
+    browser: BrowserConfig | None = None,
 ) -> tuple[SandboxTask, Path]:
     task_directory = root / "task"
     task_directory.mkdir(parents=True)
@@ -210,6 +214,7 @@ def make_task(
         ),
         tool_policy=policy or ToolPolicy(),
         agent=AgentTaskSpec.model_validate(agent_values),
+        browser=browser,
     )
     return task, task_directory
 
@@ -689,6 +694,49 @@ def test_prompt_instruction_and_tool_hashes_are_stable(tmp_path: Path) -> None:
         == second.model_events[0].tool_definitions_sha256
     )
     assert len(first.model_events[0].tool_definitions_sha256) == 64
+
+
+def test_browser_tools_and_exact_hosts_are_exposed_provider_neutrally(tmp_path: Path) -> None:
+    browser = BrowserConfig(
+        source_profiles=(BrowserSourceProfile.SEC_EDGAR,),
+        user_agent="OneOxygen-Test/1.0 test@example.com",
+    )
+    task, task_directory = make_task(
+        tmp_path,
+        browser=browser,
+        policy=ToolPolicy(
+            allowed_tool_names=("browser_sources", "browser_open"),
+            max_total_tool_calls=4,
+        ),
+        agent_updates={
+            "data_classification": "public",
+            "required_submission": False,
+            "final_text_without_submission": "succeed",
+        },
+    )
+
+    docker = FakeDockerAdapter()
+    if os.geteuid() != 0:
+        docker.sandbox_user = f"{os.geteuid()}:{os.getegid()}"
+    record, runner, docker = scripted_run(
+        tmp_path,
+        [{"text": "Browser tools are available.", "finish_reason": "completed"}],
+        task=task,
+        task_directory=task_directory,
+        docker=docker,
+    )
+
+    assert record.final_status is RunStatus.SUCCEEDED
+    assert {definition.name for definition in runner._tool_definitions} == {
+        "browser_open",
+        "browser_sources",
+    }
+    assert record.system_prompt_content is not None
+    assert "Exact allowed hosts:" in record.system_prompt_content
+    assert "www.sec.gov" in record.system_prompt_content
+    assert record.browser_configuration == browser
+    assert record.browser_policy_sha256 is not None
+    assert docker.environments == [{}]
 
 
 def test_provider_error_redacts_secrets_and_host_paths_from_run_record(

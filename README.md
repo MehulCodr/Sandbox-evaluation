@@ -9,6 +9,9 @@ One Oxygen is a local, provider-neutral agent runner built in phases:
 - Phase 3B adds explicit inference transports and provenance, official OpenAI Batch execution,
   durable turn-level suspension, immutable workspace checkpoints, a deterministic mock batch
   backend, and an experimental Api.Airforce direct gateway.
+- Browser integration adds opt-in, provider-neutral, host-side web research against exact
+  reviewed public-source profiles while preserving disabled networking in the execution
+  container.
 
 Phase 3B implements official batch execution only for OpenAI. Anthropic, Gemini, xAI, and
 DeepSeek batch backends remain intentionally deferred. It does not use an agent framework, the
@@ -28,6 +31,8 @@ The main boundaries are:
   temporary resources.
 - `SecureWorkspace`: exposes a workspace-only filesystem view to file tools and rejects
   traversal, symbolic links, protected paths, binary text operations, and oversized data.
+- `SecureBrowserClient`: provides host-side, read-only retrieval from exact selected public
+  HTTPS hosts while the execution container remains network-disabled.
 - `ToolRegistry` and `ToolDispatcher`: expose canonical provider-neutral schemas, enforce
   `ToolPolicy`, execute calls sequentially, normalize errors, track submission, and write
   bounded `ToolEvent` records.
@@ -49,10 +54,10 @@ and Python work is executed in Docker; the SDK is never installed in or passed t
 
 Task content and model execution settings are separate experimental dimensions.
 
-The task YAML contains sandbox policy, input assets, tool policy, and an optional
-provider-independent `agent` section. It does not contain a provider, model ID, API key,
-temperature, or retry settings. Existing Phase 1 and Phase 2 task files without `agent` continue
-to load and work.
+The task YAML contains sandbox policy, input assets, tool policy, an optional
+provider-independent `agent` section, and an optional exact-source `browser` section. It does not
+contain a provider, model ID, API key, temperature, or retry settings. Existing Phase 1 and Phase
+2 task files without `agent` or `browser` continue to load and work.
 
 The Phase 3A example uses:
 
@@ -92,30 +97,171 @@ All values are validated in immutable Pydantic models. Adapters reject unsupport
 adapter settings are recorded separately in `run.json`. No model name is hard-coded as a
 default.
 
-## Agent Lifecycle
+## Adding or Selecting a Model
 
-For each agent run, One Oxygen:
+Model IDs are runtime inputs, not entries in the repository. To run a model through an already
+supported provider, install its optional SDK if needed, keep the API key in the host environment,
+and pass the exact provider/model pair:
 
-1. Validates the task, instruction, prompt, tool policy, and model-run configuration.
-2. Creates a fresh `SandboxSession`, copies declared inputs, and starts one hardened container.
-3. Starts provider conversation state in the host adapter.
-4. Sends the versioned system prompt, task instruction, allowed canonical tools, and previous
-   turn's tool results.
-5. Normalizes and records the model response before acting on it.
-6. Rejects duplicate call IDs and executes returned calls sequentially in provider order.
-7. Sends bounded, sanitized `ToolResult` values back through the adapter.
-8. Repeats until submission or an explicit stop condition.
-9. Stops the sandbox before artifact copying.
-10. On successful submission, copies exactly the submitted output files and verifies their sizes
-    and hashes. Unsubmitted files are not retained by an agent run.
-11. Persists the final `RunRecord`, removes the container, and deletes the temporary workspace.
+```powershell
+python -m oneoxygen_sandbox models list
+python -m oneoxygen_sandbox models doctor --provider openai
+python -m oneoxygen_sandbox agent-run path/to/task.yaml `
+  --provider openai `
+  --model "<PROVIDER_MODEL_ID>"
+```
 
-Several calls may be returned in one model turn. They are never executed concurrently. If
-`submit_result` succeeds, later calls in the same response are still traced but rejected with
-`already_submitted`.
+The task YAML remains provider-independent, so the same task, browser source profiles, prompt,
+tool policy, and scoring conditions can be reused with another adapter. `ModelRunConfig` records
+the provider, requested model ID, inference transport, output limit, timeout, retry policy,
+sampling settings, schema mode, and provider-storage request. No provider key or default model ID
+is stored in the task.
 
-Legacy `run` and `tool-demo` workflows retain their Phase 1/2 behavior and collect approved
-files from the configured output directory.
+Adding a new provider such as a direct Anthropic/Claude adapter requires these code-level
+extension points:
+
+1. Add its stable value to `ModelProvider` and define its allowed transport/provenance rules in
+   `ModelRunConfig`.
+2. Implement `ModelAdapter` in `src/oneoxygen_sandbox/model_adapters/<provider>.py`. The adapter
+   validates configuration, declares factual capabilities, owns private conversation state,
+   converts canonical `ToolDefinition` values to the provider's function/tool format, and
+   normalizes provider output into `ModelTurnResponse`.
+3. Keep authentication and SDK objects inside the host adapter. Never place credentials in task
+   YAML, prompts, tool calls, Docker environment variables, or run records.
+4. Add a lazy factory to `model_adapters/registry.py` and register it in
+   `default_model_adapter_registry()`, with an optional dependency name when an SDK is required.
+   Listing providers must continue to work without importing the SDK or making a network call.
+5. Export the adapter where appropriate, add its optional package dependency and CLI credential
+   checks, and add mocked contract tests for schemas, tool calls, usage, finish reasons, retries,
+   timeouts, malformed output, sanitization, and secret separation.
+6. Implement a separate `BatchBackend` only if the provider has a supported asynchronous batch
+   API. A direct adapter does not automatically create batch support.
+
+An adapter must expose only One Oxygen's canonical custom tools. Provider-hosted web search,
+computer use, code execution, file search, MCP, or similar hosted tools are not silently enabled.
+The browser integration therefore works unchanged for any new adapter: the provider sees
+`browser_sources` and `browser_open` as ordinary canonical function definitions when the task
+allows them, and their calls return through the same dispatcher as every other model.
+
+## End-to-End Evaluation Lifecycle
+
+The direct evaluation path is:
+
+```mermaid
+flowchart TD
+    A[Task YAML, instruction, and declared assets] --> D[Validated SandboxTask]
+    B[Provider, model ID, host credential, run options] --> C[ModelRunConfig]
+    C --> E[ModelAdapterRegistry creates adapter]
+    D --> F[AgentRunner]
+    E --> F
+    F --> G[SandboxSession and network-disabled container]
+    F --> H[ModelTurnRequest with prompt and allowed tools]
+    H --> I[Provider adapter and model API]
+    I --> J[Normalized ModelTurnResponse]
+    J --> K[ModelEvent recorded before action]
+    K --> L{Tool calls returned?}
+    L -- Yes --> M[ToolDispatcher validates and executes sequentially]
+    M --> N[Bounded ToolResult and ToolEvent]
+    N --> H
+    L -- No or terminal --> O[Termination and cleanup]
+    O --> P[Atomic run.json and approved artifacts]
+```
+
+For each run, One Oxygen performs the following:
+
+1. `load_task()` parses the task YAML into immutable models and validates sandbox paths, agent
+   limits, tool permissions, data classification, and optional browser configuration.
+2. The CLI builds `ModelRunConfig` from `--provider`, `--model`, transport, timeout, retry, output,
+   temperature, schema, and provider-storage options.
+3. `ModelAdapterRegistry` resolves a registered provider, verifies its optional SDK, and creates
+   the adapter. The adapter validates the requested settings before any provider call.
+4. `AgentRunner` safely reads the instruction and system prompt. For browser-enabled tasks it
+   appends the selected source profiles, exact hosts, and untrusted-web-content rule.
+5. The runner filters the canonical registry to only the definitions allowed by `ToolPolicy`,
+   hashes that exact schema set, and verifies that a required submission tool is present.
+6. `SandboxSession` creates the initial version 4 `RunRecord`, a private temporary workspace, and
+   one hardened network-disabled container. Declared input assets are copied into the workspace;
+   provider credentials are not.
+7. The runner initializes host-side adapter conversation state and sends a `ModelTurnRequest`
+   containing the turn number, prompt, instruction, allowed tool definitions, normalized run
+   configuration, and any results from the preceding turn.
+8. The adapter translates that request to its provider API. One Oxygen applies the remaining wall
+   time to the request timeout and centrally retries only classified transient failures.
+9. Provider output is normalized and identity-checked for provider, model, transport, host, and
+   provenance. Inconsistent routes are rejected before the response can be accepted.
+10. Before executing any requested tool, the normalized response is appended as a `ModelEvent`
+    containing bounded text, its complete SHA-256, ordered tool-call traces, finish reason, usage,
+    attempts, latency, warnings, sanitized provider metadata, and requested/returned model IDs.
+11. Duplicate call IDs are rejected. Otherwise, if the response contains tool calls,
+    `ToolDispatcher` validates their arguments and processes them sequentially in provider order.
+    Every returned call consumes the configured call budget, including unknown, invalid,
+    disallowed, or over-limit calls. Required-submission reachability is rechecked as budgets are
+    consumed.
+12. Each call becomes a bounded `ToolResult` for the next model turn and a hashed `ToolEvent` for
+    the run record. Model-visible failures use normalized error codes without internal paths,
+    secrets, SDK objects, or stack traces.
+13. The loop continues with the same workspace until successful submission, final text, refusal,
+    content filtering, a provider failure, model/tool/token/turn/time limit, sandbox failure,
+    cancellation, or an internal orchestration error.
+14. A successful `submit_result` closes submission state. Later calls in the same provider
+    response are still recorded but fail with `already_submitted`.
+15. The container is stopped before artifact collection. Only explicitly submitted files under
+    the permitted output directory are copied, size-checked, and SHA-256 verified.
+16. Terminal status, reason, metrics, errors, timestamps, and artifact metadata are finalized.
+    `run.json` is written atomically, the adapter is closed, the container is removed, and the
+    temporary workspace is deleted on every terminal path.
+
+Provider-batch evaluations use `eval enqueue` and `DurableAgentCoordinator` instead of keeping a
+direct call open. The coordinator persists ready-turn state in SQLite, materializes compatible
+batch requests, restores immutable workspace checkpoints before tool execution, applies results
+by internal request ID, and eventually produces the same normalized model/tool events and final
+run record. Only OpenAI currently has an official provider-batch backend.
+
+### Tools a model can call
+
+The model receives only definitions allowed by the task. Registration alone does not grant
+permission.
+
+| Tool | Availability and execution boundary |
+|---|---|
+| `list_files` | Default. Lists bounded workspace entries through `SecureWorkspace`; symbolic links and protected paths are excluded. |
+| `read_text_file` | Default. Reads bounded UTF-8 workspace text with optional line ranges. |
+| `write_text_file` | Default. Atomically writes bounded UTF-8 workspace files subject to path and overwrite rules. |
+| `replace_text` | Default. Atomically performs an exact replacement only when the expected match count is satisfied. |
+| `submit_result` | Default. Submits the final summary, optional structured findings, and explicit output artifact paths. |
+| `execute_shell` | Optional. Runs inside the hardened container only when the tool name is allowed and `shell_execution_allowed` is true. Container networking remains disabled. |
+| `execute_python` | Optional. Runs a temporary source file inside the hardened container only when allowed and `python_execution_allowed` is true. |
+| `browser_sources` | Optional browser tool. Returns selected profiles, exact hosts, and policy hash without a network request. |
+| `browser_open` | Optional browser tool. Performs a host-side, read-only request to one exact selected HTTPS host; it is unavailable without validated browser configuration. |
+
+The model cannot call Docker, raw sockets, a generic HTTP client, provider SDKs, arbitrary host
+filesystem APIs, browser DevTools, or any tool not present in its request. Shell or Python cannot
+bypass the browser policy because those tools execute in the network-disabled container.
+
+### How responses and artifacts are stored
+
+Local normalized storage and provider-side storage are separate:
+
+| Data | Storage behavior |
+|---|---|
+| Model response | Stored locally as a bounded, sanitized `ModelEvent` in `runs/<run-id>/run.json`. It includes response text up to the event limit, a SHA-256 of the complete original text, tool-call traces, usage, timing, finish reason, requested/returned model, attempts, warnings, and allowlisted metadata. |
+| Tool call and result | Stored as a bounded `ToolEvent` with sequence, call ID, tool name, redacted/bounded arguments, status, normalized error code, timing, result preview, and complete argument/result hashes. The bounded `ToolResult` is also returned to the model on the next turn. |
+| Browser response | Stored through the same `ToolEvent` path as bounded extracted text and metadata. Raw unrestricted response bodies, headers, cookies, and browser caches are not retained. URL query values in traces are replaced by size and SHA-256. |
+| Prompt and task | The bounded system prompt and complete prompt hash are stored. The task instruction is represented by its SHA-256; host task paths are not persisted. |
+| Configuration and provenance | Stores task/configuration hashes, requested and effective model settings, adapter route, API host, inference transport, provenance, browser configuration, exact allowed hosts, and browser policy hash. |
+| Submission | Stores the submitted summary, optional structured findings, requested artifact paths, and verified artifact metadata. |
+| Files | Only successfully submitted files are retained under `runs/<run-id>/artifacts/`. Other temporary workspace files are deleted during cleanup. |
+| Metrics and terminal outcome | Stores aggregate model turns, provider attempts, tool counts, token fields when reported, latency, total wall time, final status, termination reason, sanitized error, and timestamps. |
+| Provider-side response | Disabled by default. `--store-provider-response` requests provider storage only when the adapter supports it; for OpenAI the normal default is `store=False`. This option does not change the bounded local run record. |
+| Secrets and raw provider objects | Never stored. API keys, authorization headers, unrestricted SDK responses, stack traces, Docker secrets, and host workspace paths are excluded or sanitized. |
+
+The direct runner accumulates normalized events in the in-memory `RunRecord` and atomically writes
+the complete JSON record during terminal session cleanup. Durable/batch runs additionally persist
+coordinator state, batch correlation data, and immutable workspace checkpoint generations so a
+run can resume without treating provider-private response objects as benchmark evidence.
+
+Legacy `run` and `tool-demo` workflows retain their Phase 1/2 behavior and collect approved files
+from the configured output directory.
 
 ## Model Adapter Contract
 
@@ -140,11 +286,13 @@ chat-message history.
 
 The default registry includes:
 
-- `scripted`, available in the base installation; and
-- `openai`, available when the optional `openai` dependency is installed.
+- `scripted`, available in the base installation;
+- `openai`, available when the optional `openai` dependency is installed; and
+- `airforce`, the explicitly acknowledged experimental Api.Airforce gateway, which also uses the
+  optional OpenAI-compatible SDK.
 
 Listing adapters is deterministic, makes no network request, and does not import the optional
-OpenAI SDK.
+provider SDK.
 
 ## Scripted Adapter
 
@@ -270,10 +418,14 @@ Available provider-neutral tools are:
 - `replace_text`: atomically replace exact text only when the expected count matches.
 - `execute_shell`: execute a shell command inside the active sandbox container.
 - `execute_python`: execute a temporary Python source file inside the active container.
+- `browser_sources`: inspect the task-selected public source profiles and exact HTTPS hosts
+  without making a network request.
+- `browser_open`: retrieve one allowlisted HTTPS text page through the host-side browser broker.
 - `submit_result`: submit final findings and approved output artifacts.
 
 `execute_shell` and `execute_python` are disabled unless explicitly enabled by the task's
-`ToolPolicy`. The default policy permits bounded file operations and submission.
+`ToolPolicy`. Browser tools require an explicit public/synthetic browser configuration and remain
+disabled by the default policy. The default policy permits bounded file operations and submission.
 
 Example:
 
@@ -304,6 +456,185 @@ tool_policy:
 Tool schemas are sorted deterministically. Tool arguments and results are bounded and hashed in
 the trace; sensitive large content such as written file bodies and Python source is replaced by
 its size and SHA-256 digest.
+
+## Browser Integration
+
+The browser integration is implemented as host-side canonical tools rather than a provider-hosted
+search feature. A model requests `browser_sources` or `browser_open`; `ToolDispatcher` applies the
+task policy; and `SecureBrowserClient` performs a bounded read outside the network-disabled
+execution container. This keeps browser behavior consistent across model providers and prevents
+model API credentials from entering either the browser request or the container.
+
+The current OpenAI Responses, Api.Airforce, and scripted adapters receive the same browser tool
+definitions through `ModelTurnRequest`. The repository does not yet contain a direct
+Anthropic/Claude adapter. A future Claude or other provider adapter implementing the existing
+`ModelAdapter` contract receives the same canonical tools without browser-specific provider code.
+
+The implemented backend is a text browser for HTML, JSON, XML, XBRL, and plain text. It does not
+render JavaScript, launch a GUI browser, take screenshots, retain cookies, fill forms, upload
+files, download binary documents, or expose a general HTTP client.
+
+### Enabling browser access
+
+Browser access is off by default. A task must select immutable source profiles, explicitly allow
+`browser_open`, classify agent data as `public` or `synthetic`, and supply a truthful
+publisher-facing user agent:
+
+```yaml
+tool_policy:
+  allowed_tool_names:
+    - list_files
+    - read_text_file
+    - write_text_file
+    - browser_sources
+    - browser_open
+    - submit_result
+  max_total_tool_calls: 30
+  per_tool_call_limits:
+    browser_open: 12
+
+browser:
+  mode: live_web
+  source_profiles:
+    - sec_edgar
+    - us_macro
+  request_timeout_seconds: 20
+  maximum_redirects: 5
+  maximum_response_size_bytes: 5242880
+  maximum_text_characters: 60000
+  maximum_links: 100
+  requests_per_second: 2
+  user_agent: "BenchmarkName/1.0 diligence-contact@example.com"
+
+agent:
+  instruction_file: task.md
+  data_classification: public
+```
+
+`browser_sources` is optional but useful for allowing the model to inspect the selected profiles.
+`browser_open` is mandatory whenever a `browser` block exists. Browser tools without browser
+configuration fail task validation. Browser configuration on an agent task with missing,
+`internal`, `confidential`, or `restricted` classification also fails validation. Existing tasks
+without a browser block retain their previous configuration hash and behavior.
+
+The defaults shown above apply unless a task chooses stricter values. `source_profiles` must
+contain at least one built-in `BrowserSourceProfile`; duplicate profiles are removed. The model
+cannot add hosts, supply headers or credentials, change the HTTP method, or expand the policy
+through tool arguments.
+
+### Built-in U.S. financial-due-diligence sources
+
+Profiles contain exact hosts, not suffix wildcards. Selecting `sec_edgar` does not allow every
+SEC or `.gov` subdomain.
+
+| Profile | Exact allowed hosts | Typical diligence use |
+|---|---|---|
+| `sec_edgar` | `sec.gov`, `www.sec.gov`, `data.sec.gov`, `efts.sec.gov` | SEC filings, exhibits, submissions, filing search, and XBRL company facts. |
+| `us_macro` | `fred.stlouisfed.org`, `api.stlouisfed.org`, `www.bls.gov`, `download.bls.gov`, `www.bea.gov`, `apps.bea.gov`, `www.census.gov`, `api.census.gov`, `data.census.gov`, `fiscaldata.treasury.gov`, `api.fiscaldata.treasury.gov` | Macroeconomic, labor, industry, demographic, and fiscal data. |
+| `regulated_financial` | `banks.data.fdic.gov`, `www.ffiec.gov`, `www.occ.gov`, `www.consumerfinance.gov`, `files.consumerfinance.gov` | Bank identity, structure, financial trends, enforcement, and complaint data. |
+| `federal_counterparty` | `sam.gov`, `api.sam.gov`, `open.gsa.gov`, `usaspending.gov`, `www.usaspending.gov`, `api.usaspending.gov` | Federal entity registration, exclusions, contracts, grants, and awards. |
+| `ofac_sanctions` | `ofac.treasury.gov`, `sanctionssearch.ofac.treas.gov`, `sanctionslist.ofac.treas.gov` | OFAC sanctions-list screening and follow-up review. |
+| `antitrust` | `www.ftc.gov`, `www.justice.gov` | FTC and DOJ antitrust cases, proceedings, and merger materials. |
+| `workplace_environment` | `echo.epa.gov`, `www.osha.gov` | EPA facility enforcement and OSHA establishment-inspection data. |
+| `us_ip` | `www.uspto.gov`, `ppubs.uspto.gov`, `data.uspto.gov`, `tsdr.uspto.gov`, `tmsearch.uspto.gov` | Patent and trademark search, status, and public documents. |
+| `tax_exempt` | `www.irs.gov`, `apps.irs.gov` | Exempt-organization status and public Form 990 material. |
+| `healthcare_public` | `www.fda.gov`, `open.fda.gov`, `api.fda.gov`, `www.cms.gov`, `data.cms.gov` | FDA approvals, recalls, safety data, providers, and reimbursement. |
+| `energy_public` | `www.eia.gov`, `api.eia.gov`, `www.ferc.gov`, `elibrary.ferc.gov` | Energy data, tariffs, orders, and filings. |
+| `telecom_public` | `www.fcc.gov`, `publicfiles.fcc.gov` | FCC licenses, proceedings, ownership reports, and public files. |
+
+Licensed platforms, fee-bearing court systems, state registries with anti-automation terms,
+general search engines, news sites, social networks, issuer sites, and user-supplied origins are
+not enabled by these profiles. Some public APIs require publisher keys; key-required routes remain
+unavailable because the current browser broker does not inject credentials. The source research,
+licensed-platform review, and rules for adding future profiles are documented in
+[browser-integration.md](browser-integration.md).
+
+### Browser request and response policy
+
+Every `browser_open` call enforces the following:
+
+- only absolute `https://` URLs using port 443 and an exact selected hostname are accepted;
+- user information, passwords, IP literals, wildcard hosts, unlisted subdomains, backslashes,
+  whitespace, control characters, and non-default ports are rejected; fragments are removed;
+- DNS is resolved by the broker, every answer must be globally routable, and mixed
+  public/private results fail closed;
+- the validated IP address is pinned for the connection while the original hostname remains in
+  TLS SNI and certificate verification;
+- every redirect is checked against the same policy before it is followed;
+- requests use only `GET`, a fixed safe header set, no cookies, no session state, no body, and the
+  task's declared user agent;
+- time, redirect, response-byte, extracted-text, link, total-tool-call, per-tool-call, and
+  per-host rate limits are enforced;
+- only supported text content is returned, scripts and style content are omitted from HTML
+  extraction, and returned links must pass the same exact-host policy; and
+- page content is marked as untrusted evidence so web instructions cannot change the task,
+  system prompt, tool policy, or source catalog.
+
+A successful result contains the requested and final URL, redirect chain, HTTP status, content
+type, title, bounded text, same-policy links, matching source profile, UTC retrieval timestamp,
+captured byte count and SHA-256, truncation flags, and an explicit untrusted-content warning.
+Unsupported content, network failure, blocked URLs, missing browser configuration, and redirect
+exhaustion return normalized browser tool error codes.
+
+Browser query values are removed from persisted tool-call arguments and replaced with their byte
+count and SHA-256. `RunRecord` schema version 4 additionally stores the validated
+`browser_configuration`, sorted `browser_allowed_hosts`, and `browser_policy_sha256`. The policy
+digest covers the browser configuration, policy version, selected profiles, and exact hosts.
+
+### Chrome, Firefox, Brave, and other desktop-browser policies
+
+The policy compiler derives deterministic baselines for `chrome`, `chromium`, `edge`, `brave`,
+`firefox`, `safari`, `opera`, and `vivaldi` from the same exact-host source catalog.
+
+| Browser family | Generated controls |
+|---|---|
+| Chrome, Chromium, Edge, Opera, Vivaldi | Deny-all URL blocklist, exact-host allowlist, fixed loopback proxy, empty bypass list, QUIC and browser DNS-over-HTTPS disabled, DevTools disabled, sign-in/sync/password/autofill/search restrictions, and an extension-install blocklist. |
+| Brave | Chromium controls plus Tor, Rewards, Wallet, VPN, and AI chat disablement. |
+| Firefox | Deny-all `WebsiteFilter` with exact-host exceptions, locked manual proxy and proxy DNS, DNS-over-HTTPS disabled, and account/private-browsing/password/autofill restrictions. |
+| Safari | An explicit MDM input manifest requiring a Safari WebExtension declarative ruleset and device network filter. It is not emitted as an installable profile. |
+
+Inspect the source catalog and compile a policy without making a network request:
+
+```powershell
+python -m oneoxygen_sandbox browser sources
+python -m oneoxygen_sandbox browser policy `
+  --family brave `
+  --profiles sec_edgar,ofac_sanctions `
+  --proxy-server http://127.0.0.1:8765 `
+  --user-agent "BenchmarkName/1.0 diligence-contact@example.com"
+```
+
+The policy command accepts only a loopback HTTP proxy with an explicit port and emits JSON with
+the allowed hosts, source-policy hash, browser-family policy, and complete bundle hash. It does
+not install policy, package an extension, launch a browser, or verify effective policy. A
+JavaScript-capable managed-browser backend still requires an authoritative egress proxy and
+network namespace, ephemeral profiles, extension/enterprise-policy deployment, download
+quarantine, complete network tracing, and browser-specific conformance tests.
+
+### Browser integration file map
+
+| File | Browser-integration responsibility |
+|---|---|
+| `browser-integration.md` | Full source research, threat model, architecture, public and licensed source rules, cross-browser deployment specification, evidence policy, and implementation status. |
+| `src/oneoxygen_sandbox/browser.py` | Immutable source catalog, exact URL validation, policy hashing and prompt appendix, DNS checks, pinned TLS client, redirect enforcement, rate limiting, text decoding, HTML extraction, and same-policy link filtering. |
+| `src/oneoxygen_sandbox/browser_policies.py` | Deterministic Chrome-family, Brave, Firefox, and Safari policy-bundle compilation with loopback-proxy validation and bundle hashing. |
+| `src/oneoxygen_sandbox/tools/browser.py` | Canonical `browser_sources` and `browser_open` schemas, dispatcher-facing execution, normalized browser failures, and structured result-size fitting. |
+| `src/oneoxygen_sandbox/models.py` | `BrowserMode`, `BrowserSourceProfile`, `BrowserConfig`, browser error codes, task cross-validation, and version 4 browser run-record fields. |
+| `src/oneoxygen_sandbox/config.py` | Includes configured browser policy in canonical task hashes while preserving hashes for legacy tasks without browser configuration. |
+| `src/oneoxygen_sandbox/session.py` | Records browser configuration, exact allowed hosts, and the browser policy digest when a run starts. |
+| `src/oneoxygen_sandbox/agent.py` | Adds selected profiles, exact hosts, and untrusted-content guidance to direct-agent system prompts. |
+| `src/oneoxygen_sandbox/coordinator.py` | Adds the same deterministic browser prompt appendix to durable/batch-coordinated agent turns. |
+| `src/oneoxygen_sandbox/cli.py` | Adds `browser sources` and `browser policy` commands. |
+| `src/oneoxygen_sandbox/tools/base.py` | Redacts browser query strings from persisted tool arguments and records only their size and hash. |
+| `src/oneoxygen_sandbox/tools/registry.py` | Registers both browser tools and permits an injected browser client for deterministic tests or alternate backends. |
+| `src/oneoxygen_sandbox/tools/__init__.py` | Exports the browser client protocol, secure client, and browser tools through the tools package. |
+| `src/oneoxygen_sandbox/__init__.py` | Exports browser configuration types and the managed-policy compiler through the public package API. |
+| `tests/test_browser.py` | Tests exact-host URL policy, URL normalization, private/mixed DNS rejection, redirect enforcement, HTML extraction, untrusted labeling, source hashes, and public-only task validation. |
+| `tests/test_browser_policies.py` | Tests deterministic Chrome/Brave/Firefox/Safari output, exact filters, family lockdowns, loopback-proxy rejection, and browser CLI commands. |
+| `tests/test_tools.py` | Tests browser schema registration, selected-source output, model-call dispatch, off-list rejection before client access, query redaction, run-record fields, and structured result truncation. |
+| `tests/test_agent_runner.py` | Tests that allowed browser tools and exact hosts reach model adapters through the canonical prompt/tool contract without exposing secrets to Docker. |
+| `tests/test_model_contracts.py` | Verifies legacy task hashes remain stable when the optional browser field is absent. |
+| `README.md` | Provides the operator-facing overview, configuration, source catalog, security behavior, policy commands, limitations, and this file map. |
 
 ## Security and Fairness Guarantees
 
@@ -345,7 +676,7 @@ runs/<run-id>/
     `-- ...successfully submitted agent artifacts...
 ```
 
-The version 3 `RunRecord` preserves the Phase 1/2 sandbox policy, command results, tool policy,
+The version 4 `RunRecord` preserves the Phase 1/2 sandbox policy, command results, tool policy,
 tool events, submission, final status, errors, and artifact hashes. Agent runs add:
 
 - requested model configuration and effective settings;
@@ -359,6 +690,10 @@ tool events, submission, final status, errors, and artifact hashes. Agent runs a
 - task-instruction hash and canonical tool-definition hash;
 - termination reason; and
 - aggregate model, provider-attempt, tool, token, latency, and wall-time metrics.
+
+Browser-enabled runs additionally record the complete validated browser configuration, sorted
+exact host set, and browser policy SHA-256. Browser tool events retain bounded results and hashes,
+while URL query values in call arguments are replaced with their size and hash.
 
 Missing provider usage remains unavailable rather than being changed to zero. No raw provider
 object, API key, unrestricted response, or host workspace is retained.
@@ -574,6 +909,11 @@ unknown IDs, retry selection, expiry/cancellation, unknown remote state, OpenAI 
 mock calls, `/v1/responses` shape, Airforce data policy, secret separation, malformed
 compatibility responses, missing usage, and a multi-turn offline restart demonstration.
 
+The browser tests additionally cover exact source selection, URL and DNS policy, pinned-routing
+inputs, redirect revalidation, HTML extraction, same-policy links, result bounds, trace
+redaction, model-facing tool exposure, run-record provenance, managed policy bundles, and CLI
+compilation. They use injected DNS/response fixtures and make no network request.
+
 Live OpenAI testing is marked `live_api`, requires a running Linux Docker engine, warns that it
 incurs API usage, and requires all three host environment variables:
 
@@ -621,7 +961,16 @@ git diff --check
   reduced to the remaining wall time. Transport cancellation and scheduling can add small
   overhead after a deadline, but no later tool or provider request is started.
 - There is no dollar-cost calculation, pricing table, grading, benchmark scoring, RAG,
-  financial-document tooling, spreadsheet tooling, browser automation, or web UI.
+  financial-document tooling, spreadsheet tooling, full JavaScript browser automation, or web UI.
+  Tasks may explicitly enable the provider-neutral, read-only `browser_open` text browser for
+  exact public source profiles while container networking remains disabled; see
+  [browser-integration.md](browser-integration.md).
+- Managed Chrome, Firefox, Brave, Edge, Safari, Opera, and Vivaldi policy bundles are compilation
+  outputs, not active GUI browser backends. They are not installed, launched, or claimed as a
+  security boundary by the current runtime.
+- The repository has no direct Anthropic/Claude adapter. An external or future adapter using the
+  common `ModelAdapter` contract can use the browser tools, but the current CLI cannot start a
+  Claude run directly.
 - SQLite state, retained run records, checkpoints, and artifacts are not encrypted or signed.
 - Base-image provenance is tag-based; deployments needing bit-for-bit provenance should mirror
   and digest-pin the image.

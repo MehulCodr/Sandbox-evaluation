@@ -42,6 +42,8 @@ def configuration_hash(task: SandboxTask) -> str:
     # agent. Optional Phase 3A data participates only when it is present.
     if task_data.get("agent") is None:
         task_data.pop("agent", None)
+    if task_data.get("browser") is None:
+        task_data.pop("browser", None)
     canonical = json.dumps(
         task_data,
         sort_keys=True,

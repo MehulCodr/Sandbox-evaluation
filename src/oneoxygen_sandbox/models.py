@@ -150,6 +150,25 @@ class DataClassification(StrEnum):
     RESTRICTED = "restricted"
 
 
+class BrowserMode(StrEnum):
+    LIVE_WEB = "live_web"
+
+
+class BrowserSourceProfile(StrEnum):
+    SEC_EDGAR = "sec_edgar"
+    US_MACRO = "us_macro"
+    REGULATED_FINANCIAL = "regulated_financial"
+    FEDERAL_COUNTERPARTY = "federal_counterparty"
+    OFAC_SANCTIONS = "ofac_sanctions"
+    ANTITRUST = "antitrust"
+    WORKPLACE_ENVIRONMENT = "workplace_environment"
+    US_IP = "us_ip"
+    TAX_EXEMPT = "tax_exempt"
+    HEALTHCARE_PUBLIC = "healthcare_public"
+    ENERGY_PUBLIC = "energy_public"
+    TELECOM_PUBLIC = "telecom_public"
+
+
 class ToolSchemaMode(StrEnum):
     PORTABLE = "portable"
     NATIVE_STRICT = "native_strict"
@@ -194,6 +213,11 @@ class ToolErrorCode(StrEnum):
     INVALID_ARGUMENTS = "invalid_arguments"
     TOOL_NOT_ALLOWED = "tool_not_allowed"
     CALL_LIMIT_EXCEEDED = "call_limit_exceeded"
+    BROWSER_NOT_CONFIGURED = "browser_not_configured"
+    URL_NOT_ALLOWED = "url_not_allowed"
+    NETWORK_ACCESS_FAILED = "network_access_failed"
+    UNSUPPORTED_CONTENT_TYPE = "unsupported_content_type"
+    REDIRECT_LIMIT_EXCEEDED = "redirect_limit_exceeded"
     PATH_NOT_ALLOWED = "path_not_allowed"
     FILE_NOT_FOUND = "file_not_found"
     BINARY_FILE = "binary_file"
@@ -588,6 +612,47 @@ class SandboxSpec(StrictModel):
         return PurePosixPath(self.working_directory).relative_to("/workspace")
 
 
+class BrowserConfig(StrictModel):
+    mode: BrowserMode = BrowserMode.LIVE_WEB
+    source_profiles: tuple[BrowserSourceProfile, ...] = Field(min_length=1, max_length=32)
+    request_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
+    maximum_redirects: int = Field(default=5, ge=0, le=20)
+    maximum_response_size_bytes: int = Field(
+        default=5 * 1024 * 1024,
+        ge=1_024,
+        le=50 * 1024 * 1024,
+    )
+    maximum_text_characters: int = Field(default=60_000, ge=1_000, le=1_000_000)
+    maximum_links: int = Field(default=100, ge=0, le=2_000)
+    requests_per_second: float = Field(default=2.0, gt=0, le=10)
+    user_agent: str = Field(
+        min_length=8,
+        max_length=256,
+    )
+
+    @field_validator("source_profiles")
+    @classmethod
+    def validate_source_profiles(
+        cls, values: tuple[BrowserSourceProfile, ...]
+    ) -> tuple[BrowserSourceProfile, ...]:
+        deduplicated: list[BrowserSourceProfile] = []
+        for value in values:
+            if value not in deduplicated:
+                deduplicated.append(value)
+        return tuple(deduplicated)
+
+    @field_validator("user_agent")
+    @classmethod
+    def validate_user_agent(cls, value: str) -> str:
+        normalized = value.strip()
+        if any(character in normalized for character in "\x00\r\n"):
+            raise ValueError("browser user agent must be a single line")
+        sanitized = sanitize_model_trace_text(normalized)
+        if "[REDACTED]" in sanitized or "[HOST_PATH]" in sanitized:
+            raise ValueError("browser user agent may not contain secrets or host paths")
+        return normalized
+
+
 class ToolPolicy(StrictModel):
     allowed_tool_names: tuple[str, ...] = (
         "list_files",
@@ -690,6 +755,7 @@ class SandboxTask(StrictModel):
     commands: tuple[str, ...] = Field(default=(), max_length=100)
     tool_policy: ToolPolicy = Field(default_factory=ToolPolicy)
     agent: AgentTaskSpec | None = None
+    browser: BrowserConfig | None = None
 
     @field_validator("commands")
     @classmethod
@@ -700,6 +766,25 @@ class SandboxTask(StrictModel):
             if "\x00" in command:
                 raise ValueError("commands may not contain null bytes")
         return values
+
+    @model_validator(mode="after")
+    def validate_browser_relationships(self) -> SandboxTask:
+        browser_tool_names = {"browser_open", "browser_sources"}
+        enabled_browser_tools = browser_tool_names.intersection(self.tool_policy.allowed_tool_names)
+        if self.browser is None:
+            if enabled_browser_tools:
+                raise ValueError("browser tools require an explicit browser configuration")
+            return self
+        if "browser_open" not in enabled_browser_tools:
+            raise ValueError("browser configuration requires the browser_open tool")
+        if self.agent is not None and self.agent.data_classification not in {
+            DataClassification.PUBLIC,
+            DataClassification.SYNTHETIC,
+        }:
+            raise ValueError(
+                "live browser access requires public or synthetic agent data classification"
+            )
+        return self
 
 
 class ExecResult(StrictModel):
@@ -1162,7 +1247,7 @@ class RunMetrics(StrictModel):
 class RunRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    record_schema_version: int = 3
+    record_schema_version: int = 4
     run_id: str
     task_id: str
     task_version: str
@@ -1174,6 +1259,9 @@ class RunRecord(BaseModel):
     sandbox_policy: SandboxPolicy
     command_results: list[ExecResult] = Field(default_factory=list)
     tool_policy: ToolPolicy | None = None
+    browser_configuration: BrowserConfig | None = None
+    browser_allowed_hosts: tuple[str, ...] = ()
+    browser_policy_sha256: str | None = None
     tool_events: list[ToolEvent] = Field(default_factory=list)
     submission: SubmittedResult | None = None
     model_configuration: ModelRunConfig | None = None

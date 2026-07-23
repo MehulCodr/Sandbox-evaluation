@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from oneoxygen_sandbox.browser import browser_prompt_appendix
 from oneoxygen_sandbox.docker_adapter import DockerAdapter
 from oneoxygen_sandbox.errors import ConfigurationError, ModelError, SandboxError
 from oneoxygen_sandbox.model_adapters.base import ModelAdapter
@@ -455,6 +456,11 @@ class AgentRunner:
                 raise ConfigurationError("the standard system prompt is unavailable") from exc
         else:
             raise ConfigurationError("the requested built-in system prompt version is unavailable")
+        if self.task.browser is not None:
+            self._system_prompt = (
+                f"{self._system_prompt.rstrip()}\n"
+                f"{browser_prompt_appendix(self.task.browser).lstrip()}"
+            )
         if not self._instruction.strip():
             raise ConfigurationError("agent instruction file may not be empty")
         if not self._system_prompt.strip():

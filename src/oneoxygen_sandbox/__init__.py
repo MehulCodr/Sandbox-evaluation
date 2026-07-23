@@ -1,6 +1,10 @@
 """Secure local Docker sandbox runner for One Oxygen."""
 
 from oneoxygen_sandbox.agent import AgentRunner
+from oneoxygen_sandbox.browser_policies import (
+    ManagedBrowserFamily,
+    compile_managed_browser_policy,
+)
 from oneoxygen_sandbox.model_adapters import (
     ModelAdapter,
     ModelAdapterRegistry,
@@ -10,6 +14,9 @@ from oneoxygen_sandbox.model_adapters import (
 from oneoxygen_sandbox.models import (
     AgentTaskSpec,
     AgentTerminationReason,
+    BrowserConfig,
+    BrowserMode,
+    BrowserSourceProfile,
     DataClassification,
     ExecResult,
     InferenceTransport,
@@ -40,9 +47,13 @@ __all__ = [
     "AgentRunner",
     "AgentTaskSpec",
     "AgentTerminationReason",
+    "BrowserConfig",
+    "BrowserMode",
+    "BrowserSourceProfile",
     "DataClassification",
     "ExecResult",
     "InferenceTransport",
+    "ManagedBrowserFamily",
     "ModelAdapter",
     "ModelAdapterRegistry",
     "ModelCapabilities",
@@ -67,6 +78,7 @@ __all__ = [
     "ToolError",
     "ToolPolicy",
     "ToolResult",
+    "compile_managed_browser_policy",
     "default_model_adapter_registry",
 ]
 __version__ = "0.1.0"

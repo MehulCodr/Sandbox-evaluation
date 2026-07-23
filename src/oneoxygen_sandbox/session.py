@@ -15,6 +15,7 @@ from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
 
+from oneoxygen_sandbox.browser import allowed_browser_hosts, browser_policy_sha256
 from oneoxygen_sandbox.checkpoints import WorkspaceCheckpoint
 from oneoxygen_sandbox.config import configuration_hash
 from oneoxygen_sandbox.docker_adapter import Container, DockerAdapter, DockerSDKAdapter
@@ -108,6 +109,13 @@ class SandboxSession:
                 non_root_user=str(getattr(self.adapter, "sandbox_user", "10001:10001")),
             ),
             tool_policy=self.task.tool_policy,
+            browser_configuration=self.task.browser,
+            browser_allowed_hosts=(
+                allowed_browser_hosts(self.task.browser) if self.task.browser is not None else ()
+            ),
+            browser_policy_sha256=(
+                browser_policy_sha256(self.task.browser) if self.task.browser is not None else None
+            ),
         )
         try:
             self.run_directory.mkdir(parents=True, exist_ok=False)

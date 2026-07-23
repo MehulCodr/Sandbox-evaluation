@@ -13,6 +13,7 @@ from typing import Any
 from oneoxygen_sandbox.batching.backends import BatchBackend, OpenAIBatchBackend
 from oneoxygen_sandbox.batching.models import BatchItemResult, BatchJob, BatchRequest
 from oneoxygen_sandbox.batching.store import BatchArtifactStore
+from oneoxygen_sandbox.browser import browser_prompt_appendix
 from oneoxygen_sandbox.checkpoints import WorkspaceCheckpoint
 from oneoxygen_sandbox.errors import ConfigurationError, LifecycleError
 from oneoxygen_sandbox.filesystem import copy_input_assets
@@ -568,12 +569,16 @@ class DurableAgentCoordinator:
     def _system_prompt(self, task: SandboxTask, task_root: Path) -> str:
         assert task.agent is not None
         if task.agent.system_prompt_file is not None:
-            return self._read_task_file(task_root, task.agent.system_prompt_file, 256_000)
-        if task.agent.system_prompt_version != "standard_agent_v1":
-            raise ConfigurationError("unsupported built-in system prompt version")
-        return (Path(__file__).with_name("prompts") / "standard_agent_v1.txt").read_text(
-            encoding="utf-8"
-        )
+            prompt = self._read_task_file(task_root, task.agent.system_prompt_file, 256_000)
+        else:
+            if task.agent.system_prompt_version != "standard_agent_v1":
+                raise ConfigurationError("unsupported built-in system prompt version")
+            prompt = (Path(__file__).with_name("prompts") / "standard_agent_v1.txt").read_text(
+                encoding="utf-8"
+            )
+        if task.browser is not None:
+            prompt = f"{prompt.rstrip()}\n{browser_prompt_appendix(task.browser).lstrip()}"
+        return prompt
 
 
 def _sha256_text(value: str) -> str:

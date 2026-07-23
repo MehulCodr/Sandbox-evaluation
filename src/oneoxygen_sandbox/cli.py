@@ -20,6 +20,11 @@ from oneoxygen_sandbox.batching import (
     SQLiteBatchStore,
     group_compatible_requests,
 )
+from oneoxygen_sandbox.browser import SOURCE_PROFILES
+from oneoxygen_sandbox.browser_policies import (
+    ManagedBrowserFamily,
+    compile_managed_browser_policy,
+)
 from oneoxygen_sandbox.config import load_task
 from oneoxygen_sandbox.coordinator import DurableAgentCoordinator
 from oneoxygen_sandbox.docker_adapter import DockerSDKAdapter
@@ -31,6 +36,8 @@ from oneoxygen_sandbox.errors import (
 )
 from oneoxygen_sandbox.model_adapters import default_model_adapter_registry
 from oneoxygen_sandbox.models import (
+    BrowserConfig,
+    BrowserSourceProfile,
     DataClassification,
     InferenceTransport,
     ModelErrorCode,
@@ -50,10 +57,12 @@ app = typer.Typer(
     help="Secure local Docker sandbox runner for One Oxygen.",
 )
 tools_app = typer.Typer(help="Inspect provider-independent tool definitions.")
+browser_app = typer.Typer(help="Inspect browser sources and compile managed-browser policies.")
 models_app = typer.Typer(help="Inspect and diagnose model adapters without network access.")
 eval_app = typer.Typer(help="Enqueue and resume durable agent evaluations.")
 batch_app = typer.Typer(help="Build, submit, inspect, collect, and cancel batches.")
 app.add_typer(tools_app, name="tools")
+app.add_typer(browser_app, name="browser")
 app.add_typer(models_app, name="models")
 app.add_typer(eval_app, name="eval")
 app.add_typer(batch_app, name="batch")
@@ -121,6 +130,64 @@ def list_tools(
         return
     for definition in registry.definitions():
         typer.echo(f"{definition.name}: {definition.description}")
+
+
+@browser_app.command("sources")
+def list_browser_sources() -> None:
+    """List immutable public browser source profiles without making a network request."""
+    rows = [
+        {
+            "id": source.profile.value,
+            "description": source.description,
+            "hosts": list(source.hosts),
+        }
+        for source in sorted(SOURCE_PROFILES.values(), key=lambda item: item.profile.value)
+    ]
+    typer.echo(json.dumps(rows, indent=2, sort_keys=True))
+
+
+@browser_app.command("policy")
+def compile_browser_policy(
+    family: Annotated[
+        ManagedBrowserFamily,
+        typer.Option("--family", help="Managed desktop browser family."),
+    ],
+    profiles: Annotated[
+        str,
+        typer.Option(
+            "--profiles",
+            help="Comma-separated built-in source profile IDs.",
+        ),
+    ],
+    proxy_server: Annotated[
+        str,
+        typer.Option(
+            "--proxy-server",
+            help="Loopback HTTP proxy URL with an explicit port.",
+        ),
+    ],
+    user_agent: Annotated[
+        str,
+        typer.Option(
+            "--user-agent",
+            help="Truthful publisher-facing benchmark name and contact.",
+        ),
+    ],
+) -> None:
+    """Compile a deterministic policy bundle without installing or launching a browser."""
+    try:
+        selected = tuple(
+            BrowserSourceProfile(item.strip()) for item in profiles.split(",") if item.strip()
+        )
+        config = BrowserConfig(source_profiles=selected, user_agent=user_agent)
+        bundle = compile_managed_browser_policy(
+            family,
+            config,
+            proxy_server=proxy_server,
+        )
+    except (ValidationError, ValueError) as exc:
+        raise typer.BadParameter("invalid browser policy configuration") from exc
+    typer.echo(json.dumps(bundle, indent=2, sort_keys=True))
 
 
 @models_app.command("list")
